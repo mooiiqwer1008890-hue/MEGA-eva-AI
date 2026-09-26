@@ -53,3 +53,142 @@ import numpy as np
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 CHAT_ID = os.environ.get("TG_CHAT_ID")
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
+INTERVAL = os.environ.get("INTERVAL", "15m")
+LOOKBACK = int(os.environ.get("LOOKBACK", "20"))
+CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "100"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))  # 15 min default
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("quant_alert")
+
+
+# ---------------------------------------------------------------------
+# 1. DATA FETCHING
+# ---------------------------------------------------------------------
+def fetch_candles(symbol: str, interval: str, limit: int) -> np.ndarray:
+    """
+    Returns an (N, 4) array of [open, high, low, close] as floats,
+    oldest first. Raises on network/API error — caller decides how
+    to handle it (we catch it in the main loop so one bad request
+    doesn't kill the process).
+    """
+    # data-api.binance.vision is Binance's dedicated public market-data
+    # endpoint. Unlike api.binance.com, it serves only public data (no
+    # auth, no trading), and is NOT subject to the geographic blocking
+    # that returns HTTP 451 for requests from US-based servers.
+    url = "https://data-api.binance.vision/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    raw = resp.json()
+    # Binance kline fields: [open_time, open, high, low, close, volume, ...]
+    candles = np.array(
+        [[float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in raw]
+    )
+    return candles  # columns: open, high, low, close
+
+
+# ---------------------------------------------------------------------
+# 2. INDICATORS (same math as the C version)
+# ---------------------------------------------------------------------
+def z_score(closes: np.ndarray, period: int) -> float:
+    window = closes[-period:]
+    mean = window.mean()
+    std = window.std()
+    if std == 0:
+        return 0.0
+    return (closes[-1] - mean) / std
+
+
+def garman_klass_volatility(candles: np.ndarray, period: int) -> float:
+    """candles columns: open, high, low, close"""
+    window = candles[-period:]
+    o, h, l, c = window[:, 0], window[:, 1], window[:, 2], window[:, 3]
+    log_hl = np.log(h / l)
+    log_co = np.log(c / o)
+    term1 = 0.5 * log_hl**2
+    term2 = (2 * np.log(2) - 1) * log_co**2
+    variance = (term1 - term2).mean()
+    return np.sqrt(max(variance, 0)) * 100.0  # guard against tiny negative from float noise
+
+
+def classify_signal(z: float) -> str:
+    if z < -2.0:
+        return "🟢 شراء إحصائي (انحراف سلبي قوي عن المتوسط)"
+    elif z > 2.0:
+        return "🔴 بيع إحصائي (انحراف إيجابي قوي عن المتوسط)"
+    else:
+        return "⚪ محايد - لا يوجد شذوذ إحصائي واضح"
+
+
+# ---------------------------------------------------------------------
+# 3. TELEGRAM DELIVERY — safe, no shell involved
+# ---------------------------------------------------------------------
+def send_telegram_message(text: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
+        log.error("TG_BOT_TOKEN / TG_CHAT_ID not set — cannot send message.")
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    try:
+        resp = requests.post(url, data=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        log.error(f"Telegram send failed: {e}")
+        return False
+
+
+def build_report(symbol: str, interval: str, price: float, z: float, vol: float) -> str:
+    signal = classify_signal(z)
+    return (
+        f"🧠 *تحليل إحصائي - {symbol} ({interval})*\n"
+        f"-------------------------------------\n"
+        f"💵 *السعر:* ${price:,.2f}\n\n"
+        f"📐 *المؤشرات:*\n"
+        f"• Z-Score: {z:.2f}\n"
+        f"• تقلب Garman-Klass: {vol:.3f}%\n\n"
+        f"-------------------------------------\n"
+        f"🎯 *الإشارة:* {signal}\n"
+        f"-------------------------------------\n"
+        f"⚠️ _تذكير: هذه إشارة إحصائية أولية غير مُختبرة تاريخياً (Backtested).  "
+        f"لا تُستخدم كقرار تنفيذ مباشر._"
+    )
+
+
+# ---------------------------------------------------------------------
+# 4. MAIN LOOP — runs forever, survives individual failures
+# ---------------------------------------------------------------------
+def run_cycle():
+    candles = fetch_candles(SYMBOL, INTERVAL, CANDLE_LIMIT)
+    closes = candles[:, 3]
+    price = closes[-1]
+    z = z_score(closes, LOOKBACK)
+    vol = garman_klass_volatility(candles, LOOKBACK)
+    report = build_report(SYMBOL, INTERVAL, price, z, vol)
+    sent = send_telegram_message(report)
+    log.info(
+        f"{SYMBOL} price={price:.2f} z={z:.2f} gk_vol={vol:.3f}% "
+        f"telegram_sent={sent}"
+    )
+
+
+def main():
+    log.info(f"Starting quant_alert for {SYMBOL} ({INTERVAL}), polling every {POLL_SECONDS}s")
+    while True:
+        try:
+            run_cycle()
+        except requests.RequestException as e:
+            log.error(f"Network error this cycle, will retry next cycle: {e}")
+        except Exception as e:
+            # Catch-all so a transient bug never kills the whole process —
+            # but we still log it loudly so you notice and fix it.
+            log.exception(f"Unexpected error this cycle: {e}")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
