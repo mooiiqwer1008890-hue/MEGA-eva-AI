@@ -211,13 +211,6 @@ def run_execution_step(symbol, price, z):
                 log.info(f"[EXEC:{symbol}] Opened test position: entry={entry_price} qty={qty}")
             except requests.RequestException as e:
                 log.error(f"[EXEC:{symbol}] Order failed: {e}")
-    else:
-        position["opened_candle_count"] += 1
-        if position["opened_candle_count"] >= HOLD_CANDLES:
-            try:
-                order = place_market_order(symbol, "SELL", quantity=position["qty"])
-                fills = order.get("fills", [])
-                exit_price = float(fills[0]["price"]) if fills else price
                 pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
                 send_telegram_message(
                     f"🔴 *خروج تجريبي (Testnet) — {symbol}*\n"
@@ -273,7 +266,7 @@ def run_cycle():
 def main():
     require_config()
     log.info(
-        f"Starting quant_alert for {SYMBOL} ({INTERVAL}), polling every {POLL_SECONDS}s. "
+        f"Starting quant_alert for {', '.join(SYMBOLS)} ({INTERVAL}), polling every {POLL_SECONDS}s. "
         f"Testnet execution: {'ENABLED' if EXECUTION_ENABLED else 'disabled'}"
     )
     while True:
