@@ -1,54 +1,41 @@
 """
-quant_alert.py
-===============
-Python replacement for the C/Termux BTC analysis bot.
+quant_alert.py  (combined version)
+===================================
+Runs BOTH of our tools as ONE process, so a single Railway service
+(free-tier friendly) covers everything:
 
-What changed vs. the original C version, and why:
+1. The statistical alert (Z-score + Garman-Klass) — sent to Telegram
+   every cycle, exactly as before.
+2. Paper-trading execution on Binance Testnet — using ONLY the
+   buy-side signal our backtest validated (see backtest_zscore.py
+   results: buy signal had a real historical edge; sell signal did
+   not, so it is deliberately never traded here).
 
-1. SECRETS: Bot token / chat ID are read from environment variables,
-   never hardcoded. Set them in Railway's "Variables" tab, not in code.
-   NEVER commit a token to git, even in a private repo.
+WHY COMBINED INTO ONE FILE:
+Railway's free trial only allows one service per project without
+paying. Rather than two separate always-on processes, this single
+loop does the market fetch ONCE per cycle and then does both jobs
+with that same data — alert and (optionally) execution.
 
-2. NO SHELL INJECTION: The original C code built a curl command by
-   string-concatenating the message text, so a literal "$" in the
-   message (e.g. "$67234.50") could trigger shell variable expansion
-   and silently corrupt or truncate the message. Here, `requests`
-   sends the message as a proper HTTP POST body — no shell involved,
-   so there is nothing to inject into.
-
-3. NO system()/curl/jq: `requests` talks to Binance and Telegram
-   directly over HTTPS. Fewer moving parts, proper error handling,
-   no dependency on external CLI tools being installed correctly.
-
-4. RUNS FOREVER, SAFELY: A loop with a sleep interval, wrapped so a
-   single failed request (network blip) doesn't crash the whole
-   process — it logs the error and tries again next cycle. This is
-   the actual requirement for "works all the time", and it has
-   nothing to do with C vs Python — it's about where it's hosted
-   (Railway, always-on) vs where it isn't (a phone Android kills).
-
-Indicators (same formulas as your C version):
-- Z-Score of the last close vs. a rolling mean/std (mean-reversion signal)
-- Garman-Klass volatility (uses OHLC, more efficient than close-only vol)
-
-IMPORTANT CAVEAT (carried over from our earlier discussion):
-The signal thresholds below (|z| > 2) are the same ones from your C
-code — they are a REASONABLE STARTING POINT, not a validated
-strategy. Before trusting this for real capital, backtest these
-thresholds properly (walk-forward, out-of-sample) using the
-feature-engineering pipeline we already built. This script is the
-DATA/ALERT layer, not a substitute for that validation step.
+GRACEFUL DEGRADATION:
+Telegram alerting is the core, must-always-work feature. Testnet
+execution is optional and additive: if BINANCE_TESTNET_API_KEY /
+BINANCE_TESTNET_API_SECRET are not set, the bot logs that execution
+is disabled and continues sending alerts normally — it does NOT
+crash the whole process over a missing execution-only variable.
 """
 
 import os
 import time
+import hmac
+import hashlib
+import json
 import logging
 import requests
 import numpy as np
 
 # ---------------------------------------------------------------------
-# CONFIG — all secrets come from environment variables, set these in
-# Railway's dashboard under Variables, never in this file.
+# CONFIG
 # ---------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 CHAT_ID = os.environ.get("TG_CHAT_ID")
@@ -58,83 +45,72 @@ LOOKBACK = int(os.environ.get("LOOKBACK", "20"))
 CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "100"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))  # 15 min default
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+# Testnet execution (optional — only activates if both are set)
+TESTNET_API_KEY = os.environ.get("BINANCE_TESTNET_API_KEY")
+TESTNET_API_SECRET = os.environ.get("BINANCE_TESTNET_API_SECRET")
+TESTNET_BASE_URL = "https://testnet.binance.vision"
+EXECUTION_ENABLED = bool(TESTNET_API_KEY and TESTNET_API_SECRET)
+
+Z_THRESHOLD = 2.0
+HOLD_CANDLES = 10  # matches the backtest horizon that showed a real edge
+TRADE_NOTIONAL_USDT = float(os.environ.get("TRADE_NOTIONAL_USDT", "15"))
+POSITION_FILE = "position_state.json"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("quant_alert")
 
 
+def require_config():
+    # Only the alerting variables are hard-required. Execution is optional.
+    missing = [n for n, v in [("TG_BOT_TOKEN", BOT_TOKEN), ("TG_CHAT_ID", CHAT_ID)] if not v]
+    if missing:
+        raise RuntimeError(f"Missing environment variable(s): {', '.join(missing)}")
+
+
 # ---------------------------------------------------------------------
-# 1. DATA FETCHING
+# MARKET DATA (public, no auth — used for both alerts and signal calc)
 # ---------------------------------------------------------------------
-def fetch_candles(symbol: str, interval: str, limit: int) -> np.ndarray:
-    """
-    Returns an (N, 4) array of [open, high, low, close] as floats,
-    oldest first. Raises on network/API error — caller decides how
-    to handle it (we catch it in the main loop so one bad request
-    doesn't kill the process).
-    """
-    # data-api.binance.vision is Binance's dedicated public market-data
-    # endpoint. Unlike api.binance.com, it serves only public data (no
-    # auth, no trading), and is NOT subject to the geographic blocking
-    # that returns HTTP 451 for requests from US-based servers.
+def fetch_candles(symbol, interval, limit):
     url = "https://data-api.binance.vision/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=10)
+    resp = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
     resp.raise_for_status()
     raw = resp.json()
-    # Binance kline fields: [open_time, open, high, low, close, volume, ...]
-    candles = np.array(
-        [[float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in raw]
-    )
-    return candles  # columns: open, high, low, close
+    return np.array([[float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in raw])
 
 
 # ---------------------------------------------------------------------
-# 2. INDICATORS (same math as the C version)
+# INDICATORS
 # ---------------------------------------------------------------------
-def z_score(closes: np.ndarray, period: int) -> float:
+def z_score(closes, period):
     window = closes[-period:]
-    mean = window.mean()
-    std = window.std()
-    if std == 0:
-        return 0.0
-    return (closes[-1] - mean) / std
+    mean, std = window.mean(), window.std()
+    return 0.0 if std == 0 else (closes[-1] - mean) / std
 
 
-def garman_klass_volatility(candles: np.ndarray, period: int) -> float:
-    """candles columns: open, high, low, close"""
+def garman_klass_volatility(candles, period):
     window = candles[-period:]
     o, h, l, c = window[:, 0], window[:, 1], window[:, 2], window[:, 3]
     log_hl = np.log(h / l)
     log_co = np.log(c / o)
-    term1 = 0.5 * log_hl**2
-    term2 = (2 * np.log(2) - 1) * log_co**2
-    variance = (term1 - term2).mean()
-    return np.sqrt(max(variance, 0)) * 100.0  # guard against tiny negative from float noise
+    variance = (0.5 * log_hl**2 - (2 * np.log(2) - 1) * log_co**2).mean()
+    return np.sqrt(max(variance, 0)) * 100.0
 
 
-def classify_signal(z: float) -> str:
+def classify_signal(z):
     if z < -2.0:
         return "🟢 شراء إحصائي (انحراف سلبي قوي عن المتوسط)"
     elif z > 2.0:
         return "🔴 بيع إحصائي (انحراف إيجابي قوي عن المتوسط)"
-    else:
-        return "⚪ محايد - لا يوجد شذوذ إحصائي واضح"
+    return "⚪ محايد - لا يوجد شذوذ إحصائي واضح"
 
 
 # ---------------------------------------------------------------------
-# 3. TELEGRAM DELIVERY — safe, no shell involved
+# TELEGRAM
 # ---------------------------------------------------------------------
-def send_telegram_message(text: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
-        log.error("TG_BOT_TOKEN / TG_CHAT_ID not set — cannot send message.")
-        return False
+def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        resp = requests.post(url, data=payload, timeout=10)
+        resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
         resp.raise_for_status()
         return True
     except requests.RequestException as e:
@@ -142,7 +118,7 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
-def build_report(symbol: str, interval: str, price: float, z: float, vol: float) -> str:
+def build_report(symbol, interval, price, z, vol):
     signal = classify_signal(z)
     return (
         f"🧠 *تحليل إحصائي - {symbol} ({interval})*\n"
@@ -154,13 +130,98 @@ def build_report(symbol: str, interval: str, price: float, z: float, vol: float)
         f"-------------------------------------\n"
         f"🎯 *الإشارة:* {signal}\n"
         f"-------------------------------------\n"
-        f"⚠️ _تذكير: هذه إشارة إحصائية أولية غير مُختبرة تاريخياً (Backtested).  "
+        f"⚠️ _تذكير: هذه إشارة إحصائية أولية غير مُختبرة تاريخياً بالكامل. "
         f"لا تُستخدم كقرار تنفيذ مباشر._"
     )
 
 
 # ---------------------------------------------------------------------
-# 4. MAIN LOOP — runs forever, survives individual failures
+# BINANCE TESTNET EXECUTION (optional layer, buy-side only)
+# ---------------------------------------------------------------------
+def signed_request(method, path, params=None):
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 10000
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    signature = hmac.new(TESTNET_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = signature
+    headers = {"X-MBX-APIKEY": TESTNET_API_KEY}
+    resp = requests.request(method, f"{TESTNET_BASE_URL}{path}", params=params, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def place_market_order(symbol, side, quote_order_qty=None, quantity=None):
+    params = {"symbol": symbol, "side": side, "type": "MARKET"}
+    if quote_order_qty is not None:
+        params["quoteOrderQty"] = quote_order_qty
+    if quantity is not None:
+        params["quantity"] = quantity
+    return signed_request("POST", "/api/v3/order", params)
+
+
+def load_position():
+    if os.path.exists(POSITION_FILE):
+        with open(POSITION_FILE) as f:
+            return json.load(f)
+    return None
+
+
+def save_position(position):
+    with open(POSITION_FILE, "w") as f:
+        json.dump(position, f)
+
+
+def clear_position():
+    if os.path.exists(POSITION_FILE):
+        os.remove(POSITION_FILE)
+
+
+def run_execution_step(price, z):
+    """Buy-only paper trading on Testnet. Never trades the sell side —
+    our backtest showed it has no predictive value."""
+    position = load_position()
+
+    if position is None:
+        if z < -Z_THRESHOLD:
+            try:
+                order = place_market_order(SYMBOL, "BUY", quote_order_qty=TRADE_NOTIONAL_USDT)
+                fills = order.get("fills", [])
+                entry_price = float(fills[0]["price"]) if fills else price
+                qty = float(order["executedQty"])
+                save_position({"entry_price": entry_price, "qty": qty, "opened_candle_count": 0})
+                send_telegram_message(
+                    f"🟢 *دخول تجريبي (Testnet) — {SYMBOL}*\n"
+                    f"السعر: ${entry_price:,.2f} | Z-Score: {z:.2f}\n"
+                    f"الكمية: {qty} | سيُغلق بعد {HOLD_CANDLES} شمعة"
+                )
+                log.info(f"[EXEC] Opened test position: entry={entry_price} qty={qty}")
+            except requests.RequestException as e:
+                log.error(f"[EXEC] Order failed: {e}")
+    else:
+        position["opened_candle_count"] += 1
+        if position["opened_candle_count"] >= HOLD_CANDLES:
+            try:
+                order = place_market_order(SYMBOL, "SELL", quantity=position["qty"])
+                fills = order.get("fills", [])
+                exit_price = float(fills[0]["price"]) if fills else price
+                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
+                send_telegram_message(
+                    f"🔴 *خروج تجريبي (Testnet) — {SYMBOL}*\n"
+                    f"دخول: ${position['entry_price']:,.2f} | خروج: ${exit_price:,.2f}\n"
+                    f"النتيجة: {pnl_pct:+.3f}% (بدون احتساب عمولة)"
+                )
+                log.info(f"[EXEC] Closed test position: exit={exit_price} pnl={pnl_pct:.3f}%")
+                clear_position()
+            except requests.RequestException as e:
+                log.error(f"[EXEC] Close order failed: {e}")
+        else:
+            save_position(position)
+            log.info(f"[EXEC] Holding ({position['opened_candle_count']}/{HOLD_CANDLES})")
+
+
+# ---------------------------------------------------------------------
+# MAIN CYCLE
 # ---------------------------------------------------------------------
 def run_cycle():
     candles = fetch_candles(SYMBOL, INTERVAL, CANDLE_LIMIT)
@@ -168,24 +229,29 @@ def run_cycle():
     price = closes[-1]
     z = z_score(closes, LOOKBACK)
     vol = garman_klass_volatility(candles, LOOKBACK)
+
     report = build_report(SYMBOL, INTERVAL, price, z, vol)
     sent = send_telegram_message(report)
-    log.info(
-        f"{SYMBOL} price={price:.2f} z={z:.2f} gk_vol={vol:.3f}% "
-        f"telegram_sent={sent}"
-    )
+    log.info(f"{SYMBOL} price={price:.2f} z={z:.2f} gk_vol={vol:.3f}% telegram_sent={sent}")
+
+    if EXECUTION_ENABLED:
+        run_execution_step(price, z)
+    else:
+        log.info("[EXEC] Testnet keys not set — execution layer disabled, alerts only.")
 
 
 def main():
-    log.info(f"Starting quant_alert for {SYMBOL} ({INTERVAL}), polling every {POLL_SECONDS}s")
+    require_config()
+    log.info(
+        f"Starting quant_alert for {SYMBOL} ({INTERVAL}), polling every {POLL_SECONDS}s. "
+        f"Testnet execution: {'ENABLED' if EXECUTION_ENABLED else 'disabled'}"
+    )
     while True:
         try:
             run_cycle()
         except requests.RequestException as e:
             log.error(f"Network error this cycle, will retry next cycle: {e}")
         except Exception as e:
-            # Catch-all so a transient bug never kills the whole process —
-            # but we still log it loudly so you notice and fix it.
             log.exception(f"Unexpected error this cycle: {e}")
         time.sleep(POLL_SECONDS)
 
