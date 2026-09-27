@@ -39,7 +39,9 @@ import numpy as np
 # ---------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 CHAT_ID = os.environ.get("TG_CHAT_ID")
-SYMBOL = os.environ.get("SYMBOL", "BTCUSDT")
+SYMBOLS = [s.strip() for s in os.environ.get(
+    "SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT"
+).split(",") if s.strip()]
 INTERVAL = os.environ.get("INTERVAL", "15m")
 LOOKBACK = int(os.environ.get("LOOKBACK", "20"))
 CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "100"))
@@ -54,7 +56,10 @@ EXECUTION_ENABLED = bool(TESTNET_API_KEY and TESTNET_API_SECRET)
 Z_THRESHOLD = 2.0
 HOLD_CANDLES = 10  # matches the backtest horizon that showed a real edge
 TRADE_NOTIONAL_USDT = float(os.environ.get("TRADE_NOTIONAL_USDT", "15"))
-POSITION_FILE = "position_state.json"
+
+
+def position_file(symbol):
+    return f"position_state_{symbol}.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("quant_alert")
@@ -118,20 +123,24 @@ def send_telegram_message(text):
         return False
 
 
-def build_report(symbol, interval, price, z, vol):
+def build_coin_section(symbol, price, z, vol):
     signal = classify_signal(z)
     return (
-        f"🧠 *تحليل إحصائي - {symbol} ({interval})*\n"
-        f"-------------------------------------\n"
-        f"💵 *السعر:* ${price:,.2f}\n\n"
-        f"📐 *المؤشرات:*\n"
-        f"• Z-Score: {z:.2f}\n"
-        f"• تقلب Garman-Klass: {vol:.3f}%\n\n"
-        f"-------------------------------------\n"
-        f"🎯 *الإشارة:* {signal}\n"
-        f"-------------------------------------\n"
-        f"⚠️ _تذكير: هذه إشارة إحصائية أولية غير مُختبرة تاريخياً بالكامل. "
-        f"لا تُستخدم كقرار تنفيذ مباشر._"
+        f"*{symbol}*  السعر: ${price:,.4f}\n"
+        f"Z-Score: {z:.2f} | GK Vol: {vol:.3f}%\n"
+        f"{signal}"
+    )
+
+
+def build_report(interval, sections):
+    body = "\n\n".join(sections)
+    return (
+        f"🧠 *تحليل إحصائي متعدد العملات ({interval})*\n"
+        f"=====================================\n"
+        f"{body}\n"
+        f"=====================================\n"
+        f"⚠️ _تذكير: هذه إشارات أولية. BTC فقط تم اختبارها تاريخياً بجدية "
+        f"(Backtested) - باقي العملات قيد المراقبة فقط حالياً، بلا تنفيذ حقيقي._"
     )
 
 
@@ -160,82 +169,103 @@ def place_market_order(symbol, side, quote_order_qty=None, quantity=None):
     return signed_request("POST", "/api/v3/order", params)
 
 
-def load_position():
-    if os.path.exists(POSITION_FILE):
-        with open(POSITION_FILE) as f:
+def load_position(symbol):
+    path = position_file(symbol)
+    if os.path.exists(path):
+        with open(path) as f:
             return json.load(f)
     return None
 
 
-def save_position(position):
-    with open(POSITION_FILE, "w") as f:
+def save_position(symbol, position):
+    with open(position_file(symbol), "w") as f:
         json.dump(position, f)
 
 
-def clear_position():
-    if os.path.exists(POSITION_FILE):
-        os.remove(POSITION_FILE)
+def clear_position(symbol):
+    path = position_file(symbol)
+    if os.path.exists(path):
+        os.remove(path)
 
 
-def run_execution_step(price, z):
-    """Buy-only paper trading on Testnet. Never trades the sell side —
-    our backtest showed it has no predictive value."""
-    position = load_position()
+def run_execution_step(symbol, price, z):
+    """Buy-only paper trading on Testnet, independent per symbol. Never
+    trades the sell side — our backtest showed it has no predictive
+    value. Each symbol has its own position file, so BTC's trade
+    never affects ETH's, etc."""
+    position = load_position(symbol)
 
     if position is None:
         if z < -Z_THRESHOLD:
             try:
-                order = place_market_order(SYMBOL, "BUY", quote_order_qty=TRADE_NOTIONAL_USDT)
+                order = place_market_order(symbol, "BUY", quote_order_qty=TRADE_NOTIONAL_USDT)
                 fills = order.get("fills", [])
                 entry_price = float(fills[0]["price"]) if fills else price
                 qty = float(order["executedQty"])
-                save_position({"entry_price": entry_price, "qty": qty, "opened_candle_count": 0})
+                save_position(symbol, {"entry_price": entry_price, "qty": qty, "opened_candle_count": 0})
                 send_telegram_message(
-                    f"🟢 *دخول تجريبي (Testnet) — {SYMBOL}*\n"
-                    f"السعر: ${entry_price:,.2f} | Z-Score: {z:.2f}\n"
+                    f"🟢 *دخول تجريبي (Testnet) — {symbol}*\n"
+                    f"السعر: ${entry_price:,.4f} | Z-Score: {z:.2f}\n"
                     f"الكمية: {qty} | سيُغلق بعد {HOLD_CANDLES} شمعة"
                 )
-                log.info(f"[EXEC] Opened test position: entry={entry_price} qty={qty}")
+                log.info(f"[EXEC:{symbol}] Opened test position: entry={entry_price} qty={qty}")
             except requests.RequestException as e:
-                log.error(f"[EXEC] Order failed: {e}")
+                log.error(f"[EXEC:{symbol}] Order failed: {e}")
     else:
         position["opened_candle_count"] += 1
         if position["opened_candle_count"] >= HOLD_CANDLES:
             try:
-                order = place_market_order(SYMBOL, "SELL", quantity=position["qty"])
+                order = place_market_order(symbol, "SELL", quantity=position["qty"])
                 fills = order.get("fills", [])
                 exit_price = float(fills[0]["price"]) if fills else price
                 pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
                 send_telegram_message(
-                    f"🔴 *خروج تجريبي (Testnet) — {SYMBOL}*\n"
-                    f"دخول: ${position['entry_price']:,.2f} | خروج: ${exit_price:,.2f}\n"
+                    f"🔴 *خروج تجريبي (Testnet) — {symbol}*\n"
+                    f"دخول: ${position['entry_price']:,.4f} | خروج: ${exit_price:,.4f}\n"
                     f"النتيجة: {pnl_pct:+.3f}% (بدون احتساب عمولة)"
                 )
-                log.info(f"[EXEC] Closed test position: exit={exit_price} pnl={pnl_pct:.3f}%")
-                clear_position()
+                log.info(f"[EXEC:{symbol}] Closed test position: exit={exit_price} pnl={pnl_pct:.3f}%")
+                clear_position(symbol)
             except requests.RequestException as e:
-                log.error(f"[EXEC] Close order failed: {e}")
+                log.error(f"[EXEC:{symbol}] Close order failed: {e}")
         else:
-            save_position(position)
-            log.info(f"[EXEC] Holding ({position['opened_candle_count']}/{HOLD_CANDLES})")
+            save_position(symbol, position)
+            log.info(f"[EXEC:{symbol}] Holding ({position['opened_candle_count']}/{HOLD_CANDLES})")
 
 
 # ---------------------------------------------------------------------
 # MAIN CYCLE
 # ---------------------------------------------------------------------
 def run_cycle():
-    candles = fetch_candles(SYMBOL, INTERVAL, CANDLE_LIMIT)
-    closes = candles[:, 3]
-    price = closes[-1]
-    z = z_score(closes, LOOKBACK)
-    vol = garman_klass_volatility(candles, LOOKBACK)
+    sections = []
+    per_symbol_data = []
 
-    report = build_report(SYMBOL, INTERVAL, price, z, vol)
-    sent = send_telegram_message(report)
-    log.info(f"{SYMBOL} price={price:.2f} z={z:.2f} gk_vol={vol:.3f}% telegram_sent={sent}")
+    for symbol in SYMBOLS:
+        try:
+            candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
+            closes = candles[:, 3]
+            price = closes[-1]
+            z = z_score(closes, LOOKBACK)
+            vol = garman_klass_volatility(candles, LOOKBACK)
+            sections.append(build_coin_section(symbol, price, z, vol))
+            per_symbol_data.append((symbol, price, z))
+            log.info(f"{symbol} price={price:.4f} z={z:.2f} gk_vol={vol:.3f}%")
+        except requests.RequestException as e:
+            log.error(f"Failed to fetch {symbol} this cycle: {e}")
+
+    if sections:
+        report = build_report(INTERVAL, sections)
+        sent = send_telegram_message(report)
+        log.info(f"Combined report sent: {sent}")
 
     if EXECUTION_ENABLED:
-        run_execution_step(price, z)
+        # BTC only: the backtested, validated buy-side edge. Other coins
+        # are alert-only for now until each is individually backtested —
+        # this is deliberate, not a bug (see our earlier discussion about
+        # not extending an unvalidated signal to more assets).
+        for symbol, price, z in per_symbol_data:
+            if symbol == "BTCUSDT":
+                run_execution_step(symbol, price, z)
     else:
         log.info("[EXEC] Testnet keys not set — execution layer disabled, alerts only.")
 
