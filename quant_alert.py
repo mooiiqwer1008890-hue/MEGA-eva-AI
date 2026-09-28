@@ -105,6 +105,7 @@ def z_series(closes, period):
     return np.array(out)
 
 
+def garman_klass_volatility(candles, period):
     window = candles[-period:]
     o, h, l, c = window[:, 0], window[:, 1], window[:, 2], window[:, 3]
     log_hl = np.log(h / l)
@@ -210,6 +211,8 @@ def make_chart_png(symbol, candles, period, entry_price=None):
     ax2.set_ylabel("Z-Score", color=fg)
     ax2.set_xlabel(f"last {n} candles ({INTERVAL})", color=fg)
 
+    fig.tight_layout()
+    buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=110, facecolor=fig.get_facecolor())
     plt.close(fig)
     return buf.getvalue()
@@ -263,6 +266,25 @@ def build_report(interval, sections):
         f"🧠 *تحليل إحصائي متعدد العملات ({interval})*\n"
         f"=====================================\n"
         f"{body}\n"
+        f"=====================================\n"
+        f"⚠️ _تذكير: هذه إشارات أولية. BTC فقط تم اختبارها تاريخياً بجدية "
+        f"(Backtested) - باقي العملات قيد المراقبة فقط حالياً، بلا تنفيذ حقيقي._"
+    )
+
+
+# ---------------------------------------------------------------------
+# BINANCE TESTNET EXECUTION (optional layer, buy-side only)
+# ---------------------------------------------------------------------
+def signed_request(method, path, params=None):
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 10000
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    signature = hmac.new(TESTNET_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = signature
+    headers = {"X-MBX-APIKEY": TESTNET_API_KEY}
+    resp = requests.request(method, f"{TESTNET_BASE_URL}{path}", params=params, headers=headers, timeout=15)
+    resp.raise_for_status()
     return resp.json()
 
 
@@ -364,6 +386,31 @@ def startup_selftest():
     """Verifies the Testnet pipeline END-TO-END at startup, instead of
     discovering a broken connection only when the first real signal
     fires. Reports the result to Telegram either way."""
+    try:
+        account = signed_request("GET", "/api/v3/account")
+    except requests.RequestException as e:
+        report_exec_error("ACCOUNT", "CONNECTION CHECK", e)
+        return False
+    balances = {b["asset"]: float(b["free"]) for b in account.get("balances", []) if float(b["free"]) > 0}
+    shown = ", ".join(f"{a}: {v:,.4f}" for a, v in list(balances.items())[:6]) or "لا أرصدة"
+    send_telegram_message(f"✅ *اتصال Testnet سليم*\nالأرصدة الوهمية: {shown}")
+    return True
+
+
+def run_cycle():
+    sections = []
+    per_symbol_data = []
+
+    for symbol in SYMBOLS:
+        try:
+            candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
+            closes = candles[:, 3]
+            price = closes[-1]
+            z = z_score(closes, LOOKBACK)
+            vol = garman_klass_volatility(candles, LOOKBACK)
+            sections.append(build_coin_section(symbol, price, z, vol))
+            per_symbol_data.append((symbol, price, z, candles))
+            log.info(f"{symbol} price={price:.4f} z={z:.2f} gk_vol={vol:.3f}%")
         except requests.RequestException as e:
             log.error(f"Failed to fetch {symbol} this cycle: {e}")
 
