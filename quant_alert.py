@@ -1,17 +1,15 @@
 """
-quant_alert.py (combined version - with HMM + GARCH)
-=====================================================
-1. Statistical Alert (Z-score + Garman-Klass).
-2. Paper Trading (local simulation) via paper_trader.py.
-3. Risk Management via Kelly Criterion.
-4. HMM Regime Detection - filter trades in Bear markets.
-5. GARCH Volatility Model - adjust position size.
-6. Daily Performance Report.
+quant_alert.py (Fast + Full Cycle + HMM + GARCH)
+=================================================
+نظام ثلاثي الطبقات:
+1. فحص سريع (كل 5 دقائق): Z-Score + إشعار عاجل.
+2. دورة كاملة (كل 30 دقيقة): HMM + GARCH + التنفيذ.
+3. تقرير يومي (كل 24 ساعة).
 
-نظام القرار ثلاثي الطبقات:
-- HMM: هل نتداول؟ (Bull = نعم، Bear = لا)
-- GARCH: كم نتداول؟ (تعديل الحجم حسب التقلب)
-- Kelly: نسبة المخاطرة (1% من رأس المال)
+المصادر:
+- Successful Algorithmic Trading (Kelly, Risk Management)
+- Advanced Algorithmic Trading (HMM, GARCH)
+- Python Trader (Paper Trading)
 """
 
 import os
@@ -33,7 +31,6 @@ from paper_trader import (
     check_and_close_position,
     load_balance,
     get_stats,
-    TRADES_LOG,
 )
 from hmm_regime import (
     get_current_regime,
@@ -58,7 +55,10 @@ SYMBOLS = [s.strip() for s in os.environ.get(
 INTERVAL = os.environ.get("INTERVAL", "15m")
 LOOKBACK = int(os.environ.get("LOOKBACK", "20"))
 CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "200"))
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))
+
+# Fast/Slow Cycle Config
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "1800"))       # 30 دقيقة
+FAST_POLL_SECONDS = int(os.environ.get("FAST_POLL_SECONDS", "300"))  # 5 دقائق
 
 # HMM Config
 HMM_INTERVAL = os.environ.get("HMM_INTERVAL", "4h")
@@ -72,6 +72,7 @@ GARCH_LIMIT = int(os.environ.get("GARCH_LIMIT", "500"))
 USE_GARCH_FILTER = os.environ.get("USE_GARCH_FILTER", "true").lower() == "true"
 
 Z_THRESHOLD = 2.0
+Z_STRONG_THRESHOLD = 2.5
 REPORT_INTERVAL_SECONDS = 86400  # 24 hours
 
 # ---------------------------------------------------------------------
@@ -142,16 +143,13 @@ def classify_signal(z):
 # HMM REGIME
 # ---------------------------------------------------------------------
 def get_market_regime(symbol):
-    """
-    يحصل على النظام الحالي للسوق (Bull/Bear) باستخدام HMM.
-    """
+    """يحصل على النظام الحالي (Bull/Bear) باستخدام HMM."""
     if not USE_HMM_FILTER:
         return {"current_regime": "Bull", "regime_prob": 1.0}
 
     try:
         returns = hmm_fetch_returns(symbol, interval=HMM_INTERVAL, limit=HMM_LIMIT)
         if len(returns) < 100:
-            log.warning(f"[HMM:{symbol}] Not enough data ({len(returns)}). Skipping filter.")
             return {"current_regime": "Bull", "regime_prob": 1.0}
 
         result = get_current_regime(returns, n_states=HMM_STATES)
@@ -169,9 +167,7 @@ def get_market_regime(symbol):
 # GARCH VOLATILITY
 # ---------------------------------------------------------------------
 def get_volatility_info(symbol):
-    """
-    يحصل على معلومات التقلب باستخدام GARCH.
-    """
+    """يحصل على معلومات التقلب باستخدام GARCH."""
     if not USE_GARCH_FILTER:
         return {
             "vol_ratio": 1.0,
@@ -184,13 +180,9 @@ def get_volatility_info(symbol):
     try:
         returns = garch_fetch_returns(symbol, interval=GARCH_INTERVAL, limit=GARCH_LIMIT)
         if len(returns) < 100:
-            log.warning(f"[GARCH:{symbol}] Not enough data ({len(returns)}). Skipping.")
             return {
-                "vol_ratio": 1.0,
-                "vol_regime": "NORMAL",
-                "annualized_vol": 0.0,
-                "current_vol": 0.0,
-                "forecast_vol": 0.0,
+                "vol_ratio": 1.0, "vol_regime": "NORMAL",
+                "annualized_vol": 0.0, "current_vol": 0.0, "forecast_vol": 0.0,
             }
 
         forecast = forecast_volatility(returns, horizon=1)
@@ -198,7 +190,7 @@ def get_volatility_info(symbol):
 
         log.info(
             f"[GARCH:{symbol}] vol_ratio={forecast['vol_ratio']:.4f} "
-            f"regime={vol_regime} annualized={forecast['annualized_vol']:.2f}%"
+            f"regime={vol_regime}"
         )
 
         return {
@@ -211,11 +203,8 @@ def get_volatility_info(symbol):
     except Exception as e:
         log.exception(f"[GARCH:{symbol}] Failed: {e}")
         return {
-            "vol_ratio": 1.0,
-            "vol_regime": "NORMAL",
-            "annualized_vol": 0.0,
-            "current_vol": 0.0,
-            "forecast_vol": 0.0,
+            "vol_ratio": 1.0, "vol_regime": "NORMAL",
+            "annualized_vol": 0.0, "current_vol": 0.0, "forecast_vol": 0.0,
         }
 
 
@@ -331,7 +320,7 @@ def send_chart(symbol, candles, caption, entry_price=None, regime=None, vol_regi
 
 
 # ---------------------------------------------------------------------
-# EXECUTION (Paper Trading + HMM + GARCH)
+# EXECUTION
 # ---------------------------------------------------------------------
 def run_execution_step(symbol, price, z, candles):
     """تشغيل منطق التداول الورقي مع HMM + GARCH."""
@@ -341,65 +330,49 @@ def run_execution_step(symbol, price, z, candles):
         with open(pos_file) as f:
             position = json.load(f)
 
-    # الحصول على النظام الحالي (HMM)
     regime_info = get_market_regime(symbol)
     current_regime = regime_info["current_regime"]
 
-    # الحصول على التقلب (GARCH)
     vol_info = get_volatility_info(symbol)
     vol_ratio = vol_info["vol_ratio"]
     vol_regime = vol_info["vol_regime"]
 
     if position is None:
-        # فتح صفقة جديدة إذا Z < -2
         if z < -Z_THRESHOLD:
-            # فلترة الإشارة بواسطة HMM
             signal = filter_signals_by_regime(1, current_regime)
 
             if signal == 0:
-                log.info(
-                    f"[EXEC:{symbol}] Buy signal BLOCKED by HMM "
-                    f"(Regime={current_regime})"
-                )
+                log.info(f"[EXEC:{symbol}] Buy signal BLOCKED by HMM (Regime={current_regime})")
                 send_telegram_message(
                     f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
-                    f"Z-Score: {z:.2f} (منطقة الشراء)\n"
+                    f"Z-Score: {z:.2f}\n"
                     f"النظام: *{current_regime}*\n"
                     f"_HMM يمنع الشراء في السوق الهابط._"
                 )
                 return
 
-            # فحص التقلب (GARCH)
-            # إذا التقلب مرتفع جداً (vol_regime = HIGH)، نمنع التداول
             if vol_regime == "HIGH" and vol_ratio > 2.0:
-                log.info(
-                    f"[EXEC:{symbol}] Buy signal BLOCKED by GARCH "
-                    f"(Vol={vol_regime}, ratio={vol_ratio:.2f})"
-                )
+                log.info(f"[EXEC:{symbol}] Buy signal BLOCKED by GARCH")
                 send_telegram_message(
                     f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
-                    f"Z-Score: {z:.2f} (منطقة الشراء)\n"
+                    f"Z-Score: {z:.2f}\n"
                     f"النظام: *{current_regime}*\n"
                     f"التقلب: *{vol_regime}* (ratio={vol_ratio:.2f})\n"
                     f"_GARCH يمنع الشراء في التقلب المرتفع._"
                 )
                 return
 
-            # تنفيذ الصفقة
             new_pos = open_paper_position(symbol, price, z)
             if new_pos is None:
                 return
 
-            # تعديل الحجم بناءً على التقلب (GARCH)
             original_size = new_pos["position_size_usd"]
             adjusted_size = adjust_position_size_by_volatility(original_size, vol_ratio)
             size_multiplier = adjusted_size / original_size if original_size > 0 else 1.0
 
-            # تحديث الكمية بناءً على الحجم المعدل
             new_pos["quantity"] = adjusted_size / price
             new_pos["position_size_usd"] = adjusted_size
 
-            # حفظ الصفقة المعدلة
             with open(pos_file, "w") as f:
                 json.dump(new_pos, f)
 
@@ -408,7 +381,6 @@ def run_execution_step(symbol, price, z, candles):
                 symbol, candles,
                 f"PAPER ENTRY {symbol}\nprice {new_pos['entry_price']:,.4f} | Z {z:.2f}\n"
                 f"qty {new_pos['quantity']:.6f} | size ${adjusted_size:.2f}\n"
-                f"SL {new_pos['stop_loss']:,.4f} | TP {new_pos['take_profit']:,.4f}\n"
                 f"Balance: ${balance:.2f} | {current_regime} | Vol: {vol_regime}",
                 entry_price=new_pos['entry_price'],
                 regime=current_regime,
@@ -419,13 +391,10 @@ def run_execution_step(symbol, price, z, candles):
                 f"السعر: ${new_pos['entry_price']:,.4f} | Z: {z:.2f}\n"
                 f"الكمية: {new_pos['quantity']:.6f}\n"
                 f"حجم الصفقة: ${adjusted_size:.2f} (Kelly × {size_multiplier:.2f})\n"
-                f"وقف الخسارة: ${new_pos['stop_loss']:,.4f}\n"
-                f"هدف الربح: ${new_pos['take_profit']:,.4f}\n"
                 f"النظام: *{current_regime}* | التقلب: *{vol_regime}*\n"
                 f"الرصيد: ${balance:.2f}"
             )
     else:
-        # إدارة الصفقة المفتوحة
         trade = check_and_close_position(symbol, price)
         if trade:
             balance = load_balance()
@@ -456,17 +425,71 @@ def run_execution_step(symbol, price, z, candles):
 _in_buy_zone = {}
 
 
-def build_coin_section(symbol, price, z, vol):
-    signal = classify_signal(z)
-    return (
-        f"*{symbol}*  السعر: ${price:,.4f}\n"
-        f"Z-Score: {z:.2f} | GK Vol: {vol:.3f}%\n"
-        f"{signal}"
-    )
+def check_urgent_signals(per_symbol_data):
+    """يفحص الإشارات العاجلة (Z < -2.5، أو دخول منطقة الشراء)."""
+    for symbol, price, z, candles in per_symbol_data:
+        if z < -Z_STRONG_THRESHOLD:
+            log.info(f"[URGENT:{symbol}] Strong buy signal (Z={z:.2f})")
+            send_telegram_message(
+                f"🚨 *إشارة عاجلة — {symbol}*\n"
+                f"Z-Score: *{z:.2f}* (انحراف قوي جداً)\n"
+                f"السعر: ${price:,.4f}\n"
+                f"_إشارة شراء قوية._"
+            )
+
+        now_in_zone = z < -Z_THRESHOLD
+        was_in_zone = _in_buy_zone.get(symbol, False)
+
+        if now_in_zone and not was_in_zone:
+            send_telegram_message(
+                f"🟢 *{symbol} دخل منطقة الشراء*\n"
+                f"Z-Score: {z:.2f}\n"
+                f"السعر: ${price:,.4f}\n"
+                f"_إشارة إحصائية - لا نصيحة._"
+            )
+
+        _in_buy_zone[symbol] = now_in_zone
+
+
+def run_cycle_fast():
+    """دورة سريعة (كل 5 دقائق): جلب البيانات + فحص الإشارات العاجلة."""
+    per_symbol_data = []
+    for symbol in SYMBOLS:
+        try:
+            candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
+            closes = candles[:, 3]
+            price = closes[-1]
+            z = z_score(closes, LOOKBACK)
+            per_symbol_data.append((symbol, price, z, candles))
+            log.info(f"[FAST] {symbol} price={price:.4f} z={z:.2f}")
+        except requests.RequestException as e:
+            log.error(f"[FAST] Failed to fetch {symbol}: {e}")
+
+    if per_symbol_data:
+        check_urgent_signals(per_symbol_data)
+
+
+def run_cycle_full():
+    """دورة كاملة (كل 30 دقيقة): HMM + GARCH + التنفيذ."""
+    per_symbol_data = []
+    for symbol in SYMBOLS:
+        try:
+            candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
+            closes = candles[:, 3]
+            price = closes[-1]
+            z = z_score(closes, LOOKBACK)
+            vol = garman_klass_volatility(candles, LOOKBACK)
+            per_symbol_data.append((symbol, price, z, candles))
+            log.info(f"[FULL] {symbol} price={price:.4f} z={z:.2f} gk_vol={vol:.3f}%")
+        except requests.RequestException as e:
+            log.error(f"[FULL] Failed to fetch {symbol}: {e}")
+
+    for symbol, price, z, candles in per_symbol_data:
+        run_execution_step(symbol, price, z, candles)
 
 
 def send_daily_report():
-    """يرسل تقرير الأداء اليومي من ملف الصفقات."""
+    """يرسل تقرير الأداء اليومي."""
     try:
         stats = get_stats()
         if stats is None:
@@ -493,85 +516,52 @@ def send_daily_report():
         log.exception(f"Failed to send daily report: {e}")
 
 
-def run_cycle():
-    per_symbol_data = []
-
-    for symbol in SYMBOLS:
-        try:
-            candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
-            closes = candles[:, 3]
-            price = closes[-1]
-            z = z_score(closes, LOOKBACK)
-            vol = garman_klass_volatility(candles, LOOKBACK)
-            per_symbol_data.append((symbol, price, z, candles))
-            log.info(f"{symbol} price={price:.4f} z={z:.2f} gk_vol={vol:.3f}%")
-        except requests.RequestException as e:
-            log.error(f"Failed to fetch {symbol} this cycle: {e}")
-
-    # Chart & Alert on entering buy zone
-    for symbol, price, z, candles in per_symbol_data:
-        now_in_zone = z < -Z_THRESHOLD
-        was_in_zone = _in_buy_zone.get(symbol, False)
-        if now_in_zone and not was_in_zone:
-            regime_info = get_market_regime(symbol)
-            vol_info = get_volatility_info(symbol)
-            send_chart(
-                symbol, candles,
-                f"{symbol}: Z = {z:.2f} entered the buy zone (< -{Z_THRESHOLD}).\n"
-                f"Regime: {regime_info['current_regime']} | Vol: {vol_info['vol_regime']}\n"
-                f"Statistical signal only - not advice.",
-                regime=regime_info['current_regime'],
-                vol_regime=vol_info['vol_regime'],
-            )
-            send_telegram_message(
-                f"🟢 *{symbol} دخل منطقة الشراء*\n"
-                f"السعر: ${price:,.4f} | Z: {z:.2f}\n"
-                f"النظام: *{regime_info['current_regime']}*\n"
-                f"التقلب: *{vol_info['vol_regime']}*\n"
-                f"⚠️ _إشارة إحصائية - Paper Trading قيد التنفيذ._"
-            )
-        _in_buy_zone[symbol] = now_in_zone
-
-    # تشغيل التداول الورقي
-    for symbol, price, z, candles in per_symbol_data:
-        run_execution_step(symbol, price, z, candles)
-
-
 def main():
     require_config()
     balance = load_balance()
     log.info(
-        f"Starting quant_alert (Paper + HMM + GARCH) for {', '.join(SYMBOLS)} "
-        f"({INTERVAL}), polling every {POLL_SECONDS}s. Balance=${balance:.2f}"
+        f"Starting quant_alert (Fast + Full) for {', '.join(SYMBOLS)} "
+        f"({INTERVAL}), fast every {FAST_POLL_SECONDS}s, full every {POLL_SECONDS}s. "
+        f"Balance=${balance:.2f}"
     )
 
     send_telegram_message(
-        f"🚀 *البوت يعمل الآن (Paper + HMM + GARCH)*\n"
+        f"🚀 *البوت يعمل الآن (Fast + Full)*\n"
         f"========================\n"
         f"💰 الرصيد: ${balance:.2f}\n"
         f"📊 العملات: {', '.join(SYMBOLS)}\n"
         f"⏱️ الفترة: {INTERVAL}\n"
-        f"🧠 HMM: {'مُفعّل' if USE_HMM_FILTER else 'مُعطّل'} ({HMM_INTERVAL}, {HMM_LIMIT} شمعة)\n"
-        f"📊 GARCH: {'مُفعّل' if USE_GARCH_FILTER else 'مُعطّل'} ({GARCH_INTERVAL}, {GARCH_LIMIT} شمعة)\n"
+        f"⚡ فحص سريع: كل {FAST_POLL_SECONDS // 60} دقيقة\n"
+        f"🔄 دورة كاملة: كل {POLL_SECONDS // 60} دقيقة\n"
+        f"🧠 HMM: {'مُفعّل' if USE_HMM_FILTER else 'مُعطّل'}\n"
+        f"📊 GARCH: {'مُفعّل' if USE_GARCH_FILTER else 'مُعطّل'}\n"
         f"========================\n"
         f"⚠️ *تداول وهمي - لا مخاطر مالية.*\n"
-        f"📌 _HMM يمنع الشراء في Bear._\n"
-        f"📌 _GARCH يعدل الحجم حسب التقلب._"
+        f"📌 _إشعار فوري عند الإشارات المهمة._"
     )
 
+    last_full_cycle = time.time()
     last_report_time = time.time()
 
     while True:
         try:
-            run_cycle()
+            run_cycle_fast()
+
+            if time.time() - last_full_cycle >= POLL_SECONDS:
+                log.info("[MAIN] Starting full cycle (HMM + GARCH)")
+                run_cycle_full()
+                last_full_cycle = time.time()
+
             if time.time() - last_report_time >= REPORT_INTERVAL_SECONDS:
                 send_daily_report()
                 last_report_time = time.time()
+
         except requests.RequestException as e:
             log.error(f"Network error this cycle: {e}")
         except Exception as e:
             log.exception(f"Unexpected error this cycle: {e}")
-        time.sleep(POLL_SECONDS)
+
+        time.sleep(FAST_POLL_SECONDS)
 
 
 if __name__ == "__main__":
