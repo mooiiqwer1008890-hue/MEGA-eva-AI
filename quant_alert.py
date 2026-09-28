@@ -1,11 +1,17 @@
 """
-quant_alert.py (combined version - with HMM Regime Detection)
-==============================================================
-1. Statistical Alert (Z-score + Garman-Klass) - sent to Telegram.
+quant_alert.py (combined version - with HMM + GARCH)
+=====================================================
+1. Statistical Alert (Z-score + Garman-Klass).
 2. Paper Trading (local simulation) via paper_trader.py.
 3. Risk Management via Kelly Criterion.
 4. HMM Regime Detection - filter trades in Bear markets.
-5. Daily Performance Report.
+5. GARCH Volatility Model - adjust position size.
+6. Daily Performance Report.
+
+نظام القرار ثلاثي الطبقات:
+- HMM: هل نتداول؟ (Bull = نعم، Bear = لا)
+- GARCH: كم نتداول؟ (تعديل الحجم حسب التقلب)
+- Kelly: نسبة المخاطرة (1% من رأس المال)
 """
 
 import os
@@ -30,9 +36,15 @@ from paper_trader import (
     TRADES_LOG,
 )
 from hmm_regime import (
-    detect_regimes,
     get_current_regime,
     filter_signals_by_regime,
+    fetch_returns as hmm_fetch_returns,
+)
+from garch_model import (
+    fetch_returns as garch_fetch_returns,
+    forecast_volatility,
+    classify_volatility,
+    adjust_position_size_by_volatility,
 )
 
 # ---------------------------------------------------------------------
@@ -50,9 +62,14 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))
 
 # HMM Config
 HMM_INTERVAL = os.environ.get("HMM_INTERVAL", "4h")
-HMM_LIMIT = int(os.environ.get("HMM_LIMIT", "500"))
+HMM_LIMIT = int(os.environ.get("HMM_LIMIT", "300"))
 HMM_STATES = int(os.environ.get("HMM_STATES", "2"))
 USE_HMM_FILTER = os.environ.get("USE_HMM_FILTER", "true").lower() == "true"
+
+# GARCH Config
+GARCH_INTERVAL = os.environ.get("GARCH_INTERVAL", "4h")
+GARCH_LIMIT = int(os.environ.get("GARCH_LIMIT", "500"))
+USE_GARCH_FILTER = os.environ.get("USE_GARCH_FILTER", "true").lower() == "true"
 
 Z_THRESHOLD = 2.0
 REPORT_INTERVAL_SECONDS = 86400  # 24 hours
@@ -84,21 +101,6 @@ def fetch_candles(symbol, interval, limit):
     resp.raise_for_status()
     raw = resp.json()
     return np.array([[float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in raw])
-
-
-def fetch_closes(symbol, interval="4h", limit=500):
-    """يجلب أسعار الإغلاق فقط (لـ HMM)."""
-    url = "https://data-api.binance.vision/api/v3/klines"
-    resp = requests.get(
-        url,
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    raw = resp.json()
-    closes = pd.Series([float(k[4]) for k in raw])
-    returns = np.log(closes / closes.shift(1)).dropna()
-    return returns
 
 
 # ---------------------------------------------------------------------
@@ -137,7 +139,7 @@ def classify_signal(z):
 
 
 # ---------------------------------------------------------------------
-# HMM REGIME DETECTION
+# HMM REGIME
 # ---------------------------------------------------------------------
 def get_market_regime(symbol):
     """
@@ -147,7 +149,7 @@ def get_market_regime(symbol):
         return {"current_regime": "Bull", "regime_prob": 1.0}
 
     try:
-        returns = fetch_closes(symbol, interval=HMM_INTERVAL, limit=HMM_LIMIT)
+        returns = hmm_fetch_returns(symbol, interval=HMM_INTERVAL, limit=HMM_LIMIT)
         if len(returns) < 100:
             log.warning(f"[HMM:{symbol}] Not enough data ({len(returns)}). Skipping filter.")
             return {"current_regime": "Bull", "regime_prob": 1.0}
@@ -161,6 +163,60 @@ def get_market_regime(symbol):
     except Exception as e:
         log.exception(f"[HMM:{symbol}] Failed: {e}")
         return {"current_regime": "Bull", "regime_prob": 1.0}
+
+
+# ---------------------------------------------------------------------
+# GARCH VOLATILITY
+# ---------------------------------------------------------------------
+def get_volatility_info(symbol):
+    """
+    يحصل على معلومات التقلب باستخدام GARCH.
+    """
+    if not USE_GARCH_FILTER:
+        return {
+            "vol_ratio": 1.0,
+            "vol_regime": "NORMAL",
+            "annualized_vol": 0.0,
+            "current_vol": 0.0,
+            "forecast_vol": 0.0,
+        }
+
+    try:
+        returns = garch_fetch_returns(symbol, interval=GARCH_INTERVAL, limit=GARCH_LIMIT)
+        if len(returns) < 100:
+            log.warning(f"[GARCH:{symbol}] Not enough data ({len(returns)}). Skipping.")
+            return {
+                "vol_ratio": 1.0,
+                "vol_regime": "NORMAL",
+                "annualized_vol": 0.0,
+                "current_vol": 0.0,
+                "forecast_vol": 0.0,
+            }
+
+        forecast = forecast_volatility(returns, horizon=1)
+        vol_regime = classify_volatility(forecast["vol_ratio"])
+
+        log.info(
+            f"[GARCH:{symbol}] vol_ratio={forecast['vol_ratio']:.4f} "
+            f"regime={vol_regime} annualized={forecast['annualized_vol']:.2f}%"
+        )
+
+        return {
+            "vol_ratio": forecast["vol_ratio"],
+            "vol_regime": vol_regime,
+            "annualized_vol": forecast["annualized_vol"],
+            "current_vol": forecast["current_vol"],
+            "forecast_vol": forecast["forecast_vol"],
+        }
+    except Exception as e:
+        log.exception(f"[GARCH:{symbol}] Failed: {e}")
+        return {
+            "vol_ratio": 1.0,
+            "vol_regime": "NORMAL",
+            "annualized_vol": 0.0,
+            "current_vol": 0.0,
+            "forecast_vol": 0.0,
+        }
 
 
 # ---------------------------------------------------------------------
@@ -197,7 +253,7 @@ def send_telegram_photo(png_bytes, caption):
         return False
 
 
-def make_chart_png(symbol, candles, period, entry_price=None, regime=None):
+def make_chart_png(symbol, candles, period, entry_price=None, regime=None, vol_regime=None):
     import io
     import matplotlib
     matplotlib.use("Agg")
@@ -240,10 +296,10 @@ def make_chart_png(symbol, candles, period, entry_price=None, regime=None):
     if entry_price:
         ax1.axhline(entry_price, color="#00e676", linestyle="--", linewidth=1.3, label=f"Entry {entry_price:,.4f}")
 
-    # إضافة النظام إلى العنوان
-    regime_text = f" | Regime: {regime}" if regime else ""
+    regime_text = f" | {regime}" if regime else ""
+    vol_text = f" | Vol: {vol_regime}" if vol_regime else ""
     ax1.set_title(
-        f"{symbol}  {INTERVAL}  |  last price {c[-1]:,.4f}  |  Z = {zs[-1]:.2f}{regime_text}",
+        f"{symbol}  {INTERVAL}  |  last price {c[-1]:,.4f}  |  Z = {zs[-1]:.2f}{regime_text}{vol_text}",
         color=fg
     )
     ax1.legend(loc="upper left", facecolor=bg, edgecolor="#2a2e39", labelcolor=fg, fontsize=8)
@@ -262,9 +318,12 @@ def make_chart_png(symbol, candles, period, entry_price=None, regime=None):
     return buf.getvalue()
 
 
-def send_chart(symbol, candles, caption, entry_price=None, regime=None):
+def send_chart(symbol, candles, caption, entry_price=None, regime=None, vol_regime=None):
     try:
-        png = make_chart_png(symbol, candles, LOOKBACK, entry_price=entry_price, regime=regime)
+        png = make_chart_png(
+            symbol, candles, LOOKBACK,
+            entry_price=entry_price, regime=regime, vol_regime=vol_regime
+        )
     except Exception as e:
         log.exception(f"Chart rendering failed for {symbol}: {e}")
         return False
@@ -272,19 +331,24 @@ def send_chart(symbol, candles, caption, entry_price=None, regime=None):
 
 
 # ---------------------------------------------------------------------
-# EXECUTION (Paper Trading + HMM Filter)
+# EXECUTION (Paper Trading + HMM + GARCH)
 # ---------------------------------------------------------------------
 def run_execution_step(symbol, price, z, candles):
-    """تشغيل منطق التداول الورقي مع فلتر HMM."""
+    """تشغيل منطق التداول الورقي مع HMM + GARCH."""
     position = None
     pos_file = f"paper_position_{symbol}.json"
     if os.path.exists(pos_file):
         with open(pos_file) as f:
             position = json.load(f)
 
-    # الحصول على النظام الحالي
+    # الحصول على النظام الحالي (HMM)
     regime_info = get_market_regime(symbol)
     current_regime = regime_info["current_regime"]
+
+    # الحصول على التقلب (GARCH)
+    vol_info = get_volatility_info(symbol)
+    vol_ratio = vol_info["vol_ratio"]
+    vol_regime = vol_info["vol_regime"]
 
     if position is None:
         # فتح صفقة جديدة إذا Z < -2
@@ -305,28 +369,60 @@ def run_execution_step(symbol, price, z, candles):
                 )
                 return
 
+            # فحص التقلب (GARCH)
+            # إذا التقلب مرتفع جداً (vol_regime = HIGH)، نمنع التداول
+            if vol_regime == "HIGH" and vol_ratio > 2.0:
+                log.info(
+                    f"[EXEC:{symbol}] Buy signal BLOCKED by GARCH "
+                    f"(Vol={vol_regime}, ratio={vol_ratio:.2f})"
+                )
+                send_telegram_message(
+                    f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
+                    f"Z-Score: {z:.2f} (منطقة الشراء)\n"
+                    f"النظام: *{current_regime}*\n"
+                    f"التقلب: *{vol_regime}* (ratio={vol_ratio:.2f})\n"
+                    f"_GARCH يمنع الشراء في التقلب المرتفع._"
+                )
+                return
+
             # تنفيذ الصفقة
             new_pos = open_paper_position(symbol, price, z)
             if new_pos is None:
                 return
+
+            # تعديل الحجم بناءً على التقلب (GARCH)
+            original_size = new_pos["position_size_usd"]
+            adjusted_size = adjust_position_size_by_volatility(original_size, vol_ratio)
+            size_multiplier = adjusted_size / original_size if original_size > 0 else 1.0
+
+            # تحديث الكمية بناءً على الحجم المعدل
+            new_pos["quantity"] = adjusted_size / price
+            new_pos["position_size_usd"] = adjusted_size
+
+            # حفظ الصفقة المعدلة
+            with open(pos_file, "w") as f:
+                json.dump(new_pos, f)
+
             balance = load_balance()
             send_chart(
                 symbol, candles,
                 f"PAPER ENTRY {symbol}\nprice {new_pos['entry_price']:,.4f} | Z {z:.2f}\n"
-                f"qty {new_pos['quantity']:.6f} | size ${new_pos['position_size_usd']:.2f}\n"
+                f"qty {new_pos['quantity']:.6f} | size ${adjusted_size:.2f}\n"
                 f"SL {new_pos['stop_loss']:,.4f} | TP {new_pos['take_profit']:,.4f}\n"
-                f"Balance: ${balance:.2f} | Regime: {current_regime}",
+                f"Balance: ${balance:.2f} | {current_regime} | Vol: {vol_regime}",
                 entry_price=new_pos['entry_price'],
                 regime=current_regime,
+                vol_regime=vol_regime,
             )
             send_telegram_message(
                 f"🟢 *فتح صفقة (Paper) — {symbol}*\n"
                 f"السعر: ${new_pos['entry_price']:,.4f} | Z: {z:.2f}\n"
                 f"الكمية: {new_pos['quantity']:.6f}\n"
-                f"حجم الصفقة: ${new_pos['position_size_usd']:.2f} (Kelly)\n"
+                f"حجم الصفقة: ${adjusted_size:.2f} (Kelly × {size_multiplier:.2f})\n"
                 f"وقف الخسارة: ${new_pos['stop_loss']:,.4f}\n"
                 f"هدف الربح: ${new_pos['take_profit']:,.4f}\n"
-                f"النظام: *{current_regime}* | الرصيد: ${balance:.2f}"
+                f"النظام: *{current_regime}* | التقلب: *{vol_regime}*\n"
+                f"الرصيد: ${balance:.2f}"
             )
     else:
         # إدارة الصفقة المفتوحة
@@ -341,6 +437,7 @@ def run_execution_step(symbol, price, z, candles):
                 f"Balance: ${balance:.2f}",
                 entry_price=trade['entry_price'],
                 regime=current_regime,
+                vol_regime=vol_regime,
             )
             emoji = "🟢" if trade['pnl_usd'] > 0 else "🔴"
             send_telegram_message(
@@ -417,17 +514,20 @@ def run_cycle():
         was_in_zone = _in_buy_zone.get(symbol, False)
         if now_in_zone and not was_in_zone:
             regime_info = get_market_regime(symbol)
+            vol_info = get_volatility_info(symbol)
             send_chart(
                 symbol, candles,
                 f"{symbol}: Z = {z:.2f} entered the buy zone (< -{Z_THRESHOLD}).\n"
-                f"Regime: {regime_info['current_regime']}\n"
+                f"Regime: {regime_info['current_regime']} | Vol: {vol_info['vol_regime']}\n"
                 f"Statistical signal only - not advice.",
                 regime=regime_info['current_regime'],
+                vol_regime=vol_info['vol_regime'],
             )
             send_telegram_message(
                 f"🟢 *{symbol} دخل منطقة الشراء*\n"
                 f"السعر: ${price:,.4f} | Z: {z:.2f}\n"
                 f"النظام: *{regime_info['current_regime']}*\n"
+                f"التقلب: *{vol_info['vol_regime']}*\n"
                 f"⚠️ _إشارة إحصائية - Paper Trading قيد التنفيذ._"
             )
         _in_buy_zone[symbol] = now_in_zone
@@ -441,21 +541,22 @@ def main():
     require_config()
     balance = load_balance()
     log.info(
-        f"Starting quant_alert (Paper + HMM) for {', '.join(SYMBOLS)} "
+        f"Starting quant_alert (Paper + HMM + GARCH) for {', '.join(SYMBOLS)} "
         f"({INTERVAL}), polling every {POLL_SECONDS}s. Balance=${balance:.2f}"
     )
 
     send_telegram_message(
-        f"🚀 *البوت يعمل الآن (Paper + HMM)*\n"
+        f"🚀 *البوت يعمل الآن (Paper + HMM + GARCH)*\n"
         f"========================\n"
         f"💰 الرصيد: ${balance:.2f}\n"
         f"📊 العملات: {', '.join(SYMBOLS)}\n"
         f"⏱️ الفترة: {INTERVAL}\n"
-        f"🧠 فلتر HMM: {'مُفعّل' if USE_HMM_FILTER else 'مُعطّل'}\n"
-        f"📊 HMM Interval: {HMM_INTERVAL} ({HMM_LIMIT} شمعة)\n"
+        f"🧠 HMM: {'مُفعّل' if USE_HMM_FILTER else 'مُعطّل'} ({HMM_INTERVAL}, {HMM_LIMIT} شمعة)\n"
+        f"📊 GARCH: {'مُفعّل' if USE_GARCH_FILTER else 'مُعطّل'} ({GARCH_INTERVAL}, {GARCH_LIMIT} شمعة)\n"
         f"========================\n"
         f"⚠️ *تداول وهمي - لا مخاطر مالية.*\n"
-        f"📌 _HMM يمنع التداول في النظام Bear._"
+        f"📌 _HMM يمنع الشراء في Bear._\n"
+        f"📌 _GARCH يعدل الحجم حسب التقلب._"
     )
 
     last_report_time = time.time()
