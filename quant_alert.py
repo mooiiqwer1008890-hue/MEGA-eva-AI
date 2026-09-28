@@ -92,7 +92,19 @@ def z_score(closes, period):
     return 0.0 if std == 0 else (closes[-1] - mean) / std
 
 
-def garman_klass_volatility(candles, period):
+def z_series(closes, period):
+    """Rolling Z-score for every candle from index period-1 onward.
+    Uses only past data at each point (no lookahead), and its LAST value
+    equals z_score(closes, period) exactly — so the chart and the alert
+    can never disagree."""
+    out = []
+    for i in range(period, len(closes) + 1):
+        w = closes[i - period:i]
+        s = w.std()
+        out.append(0.0 if s == 0 else (w[-1] - w.mean()) / s)
+    return np.array(out)
+
+
     window = candles[-period:]
     o, h, l, c = window[:, 0], window[:, 1], window[:, 2], window[:, 3]
     log_hl = np.log(h / l)
@@ -123,6 +135,119 @@ def send_telegram_message(text):
         return False
 
 
+def send_telegram_photo(png_bytes, caption):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "caption": caption[:1000]},  # plain text, no Markdown parsing
+            files={"photo": ("chart.png", png_bytes, "image/png")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        log.error(f"Telegram photo send failed: {e}")
+        return False
+
+
+def make_chart_png(symbol, candles, period, entry_price=None):
+    """Renders a candlestick chart (top) with the rolling mean and a ±2σ
+    band, and the rolling Z-score (bottom) with its ±2 thresholds.
+    Green triangles mark candles where Z < -2 — the ONLY zone our
+    backtest found any historical edge in. Labels are in English on
+    purpose: matplotlib does not shape Arabic text correctly without
+    extra libraries."""
+    import io
+    import matplotlib
+    matplotlib.use("Agg")  # headless server: no display available
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    o, h, l, c = candles[:, 0], candles[:, 1], candles[:, 2], candles[:, 3]
+    n = len(c)
+    zs = z_series(c, period)
+    zx = np.arange(period - 1, n)
+    ma = np.array([c[i - period + 1:i + 1].mean() for i in zx])
+    sd = np.array([c[i - period + 1:i + 1].std() for i in zx])
+
+    bg, fg = "#131722", "#d1d4dc"
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]}
+    )
+    fig.patch.set_facecolor(bg)
+    for ax in (ax1, ax2):
+        ax.set_facecolor(bg)
+        ax.tick_params(colors=fg)
+        for spine in ax.spines.values():
+            spine.set_color("#2a2e39")
+        ax.grid(color="#2a2e39", linewidth=0.5)
+
+    for i in range(n):
+        color = "#26a69a" if c[i] >= o[i] else "#ef5350"
+        ax1.plot([i, i], [l[i], h[i]], color=color, linewidth=1)
+        ax1.add_patch(Rectangle((i - 0.35, min(o[i], c[i])), 0.7, max(abs(c[i] - o[i]), 1e-12), color=color))
+
+    ax1.plot(zx, ma, color="#f5c542", linewidth=1.2, label=f"Mean ({period})")
+    ax1.fill_between(zx, ma - 2 * sd, ma + 2 * sd, color="#5c6bc0", alpha=0.15, label="±2σ band")
+
+    pad = (h.max() - l.min()) * 0.05
+    ax1.set_ylim(l.min() - pad, h.max() + pad)
+    buy_idx = zx[zs < -Z_THRESHOLD]
+    if len(buy_idx):
+        ax1.scatter(buy_idx, l[buy_idx] - pad * 0.5, marker="^", color="#00e676", s=70, zorder=5,
+                    label="Z < -2 (buy zone)")
+    if entry_price:
+        ax1.axhline(entry_price, color="#00e676", linestyle="--", linewidth=1.3, label=f"Paper entry {entry_price:,.4f}")
+
+    ax1.set_title(f"{symbol}  {INTERVAL}  |  last price {c[-1]:,.4f}  |  Z = {zs[-1]:.2f}", color=fg)
+    ax1.legend(loc="upper left", facecolor=bg, edgecolor="#2a2e39", labelcolor=fg, fontsize=8)
+
+    ax2.plot(zx, zs, color="#42a5f5", linewidth=1.2)
+    ax2.axhline(Z_THRESHOLD, color="#ef5350", linestyle="--", linewidth=0.9)
+    ax2.axhline(-Z_THRESHOLD, color="#00e676", linestyle="--", linewidth=0.9)
+    ax2.axhline(0, color="#787b86", linewidth=0.6)
+    ax2.set_ylabel("Z-Score", color=fg)
+    ax2.set_xlabel(f"last {n} candles ({INTERVAL})", color=fg)
+
+    fig.savefig(buf, format="png", dpi=110, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def send_chart(symbol, candles, caption, entry_price=None):
+    try:
+        png = make_chart_png(symbol, candles, LOOKBACK, entry_price=entry_price)
+    except Exception as e:  # a chart failure must never break alerts or trading
+        log.exception(f"Chart rendering failed for {symbol}: {e}")
+        return False
+    return send_telegram_photo(png, caption)
+
+
+_exec_errors_reported = set()
+
+
+def report_exec_error(symbol, action, err):
+    """Execution failures are reported to Telegram EXPLICITLY (once per
+    distinct error), instead of being swallowed in the logs. Silent
+    failure was the design flaw that hid the HTTP 451 problem."""
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    log.error(f"[EXEC:{symbol}] {action} failed (HTTP {status}): {type(err).__name__}")
+    key = (symbol, action, status)
+    if key in _exec_errors_reported:
+        return
+    _exec_errors_reported.add(key)
+    hint = ""
+    if status == 451:
+        hint = "\n451 = Binance يحجب هذا الطلب جغرافياً (خادم Railway في أمريكا)."
+    elif status in (401, 403):
+        hint = "\nتحقق من مفاتيح Testnet وصلاحياتها."
+    send_telegram_message(
+        f"⚠️ فشل تنفيذ ({action}) على {symbol}\nرمز الخطأ: {status}{hint}\n"
+        f"لن تُرسَل هذه الرسالة مرة أخرى لنفس الخطأ."
+    )
+
+
 def build_coin_section(symbol, price, z, vol):
     signal = classify_signal(z)
     return (
@@ -138,25 +263,6 @@ def build_report(interval, sections):
         f"🧠 *تحليل إحصائي متعدد العملات ({interval})*\n"
         f"=====================================\n"
         f"{body}\n"
-        f"=====================================\n"
-        f"⚠️ _تذكير: هذه إشارات أولية. BTC فقط تم اختبارها تاريخياً بجدية "
-        f"(Backtested) - باقي العملات قيد المراقبة فقط حالياً، بلا تنفيذ حقيقي._"
-    )
-
-
-# ---------------------------------------------------------------------
-# BINANCE TESTNET EXECUTION (optional layer, buy-side only)
-# ---------------------------------------------------------------------
-def signed_request(method, path, params=None):
-    params = params or {}
-    params["timestamp"] = int(time.time() * 1000)
-    params["recvWindow"] = 10000
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    signature = hmac.new(TESTNET_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    params["signature"] = signature
-    headers = {"X-MBX-APIKEY": TESTNET_API_KEY}
-    resp = requests.request(method, f"{TESTNET_BASE_URL}{path}", params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
     return resp.json()
 
 
@@ -188,39 +294,61 @@ def clear_position(symbol):
         os.remove(path)
 
 
-def run_execution_step(symbol, price, z):
+def run_execution_step(symbol, price, z, candles):
     """Buy-only paper trading on Testnet, independent per symbol. Never
     trades the sell side — our backtest showed it has no predictive
     value. Each symbol has its own position file, so BTC's trade
-    never affects ETH's, etc."""
+    never affects ETH's, etc. Every failure is reported to Telegram."""
     position = load_position(symbol)
 
     if position is None:
         if z < -Z_THRESHOLD:
             try:
                 order = place_market_order(symbol, "BUY", quote_order_qty=TRADE_NOTIONAL_USDT)
-                fills = order.get("fills", [])
-                entry_price = float(fills[0]["price"]) if fills else price
-                qty = float(order["executedQty"])
-                save_position(symbol, {"entry_price": entry_price, "qty": qty, "opened_candle_count": 0})
-                send_telegram_message(
-                    f"🟢 *دخول تجريبي (Testnet) — {symbol}*\n"
-                    f"السعر: ${entry_price:,.4f} | Z-Score: {z:.2f}\n"
-                    f"الكمية: {qty} | سيُغلق بعد {HOLD_CANDLES} شمعة"
-                )
-                log.info(f"[EXEC:{symbol}] Opened test position: entry={entry_price} qty={qty}")
             except requests.RequestException as e:
-                log.error(f"[EXEC:{symbol}] Order failed: {e}")
-                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
-                send_telegram_message(
-                    f"🔴 *خروج تجريبي (Testnet) — {symbol}*\n"
-                    f"دخول: ${position['entry_price']:,.4f} | خروج: ${exit_price:,.4f}\n"
-                    f"النتيجة: {pnl_pct:+.3f}% (بدون احتساب عمولة)"
-                )
-                log.info(f"[EXEC:{symbol}] Closed test position: exit={exit_price} pnl={pnl_pct:.3f}%")
-                clear_position(symbol)
+                report_exec_error(symbol, "BUY", e)
+                return
+            fills = order.get("fills", [])
+            entry_price = float(fills[0]["price"]) if fills else price
+            qty = float(order["executedQty"])
+            save_position(symbol, {"entry_price": entry_price, "qty": qty, "opened_candle_count": 0})
+            send_chart(
+                symbol, candles,
+                f"PAPER ENTRY (Testnet) {symbol}\nprice {entry_price:,.4f} | Z {z:.2f}\n"
+                f"qty {qty} | auto-exit after {HOLD_CANDLES} candles",
+                entry_price=entry_price,
+            )
+            send_telegram_message(
+                f"🟢 *دخول تجريبي (Testnet) — {symbol}*\n"
+                f"السعر: ${entry_price:,.4f} | Z-Score: {z:.2f}\n"
+                f"الكمية: {qty} | سيُغلق بعد {HOLD_CANDLES} شمعة"
+            )
+            log.info(f"[EXEC:{symbol}] Opened test position: entry={entry_price} qty={qty}")
+    else:
+        position["opened_candle_count"] += 1
+        if position["opened_candle_count"] >= HOLD_CANDLES:
+            try:
+                order = place_market_order(symbol, "SELL", quantity=position["qty"])
             except requests.RequestException as e:
-                log.error(f"[EXEC:{symbol}] Close order failed: {e}")
+                report_exec_error(symbol, "SELL", e)
+                save_position(symbol, position)  # keep the position; retry next cycle
+                return
+            fills = order.get("fills", [])
+            exit_price = float(fills[0]["price"]) if fills else price
+            pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
+            send_chart(
+                symbol, candles,
+                f"PAPER EXIT (Testnet) {symbol}\nentry {position['entry_price']:,.4f} -> exit {exit_price:,.4f}\n"
+                f"result {pnl_pct:+.3f}% (before fees)",
+                entry_price=position["entry_price"],
+            )
+            send_telegram_message(
+                f"🔴 *خروج تجريبي (Testnet) — {symbol}*\n"
+                f"دخول: ${position['entry_price']:,.4f} | خروج: ${exit_price:,.4f}\n"
+                f"النتيجة: {pnl_pct:+.3f}% (بدون احتساب عمولة)"
+            )
+            log.info(f"[EXEC:{symbol}] Closed test position: exit={exit_price} pnl={pnl_pct:.3f}%")
+            clear_position(symbol)
         else:
             save_position(symbol, position)
             log.info(f"[EXEC:{symbol}] Holding ({position['opened_candle_count']}/{HOLD_CANDLES})")
@@ -229,20 +357,13 @@ def run_execution_step(symbol, price, z):
 # ---------------------------------------------------------------------
 # MAIN CYCLE
 # ---------------------------------------------------------------------
-def run_cycle():
-    sections = []
-    per_symbol_data = []
+_in_buy_zone = {}  # symbol -> was Z < -threshold on the previous cycle?
 
-    for symbol in SYMBOLS:
-        try:
-            candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
-            closes = candles[:, 3]
-            price = closes[-1]
-            z = z_score(closes, LOOKBACK)
-            vol = garman_klass_volatility(candles, LOOKBACK)
-            sections.append(build_coin_section(symbol, price, z, vol))
-            per_symbol_data.append((symbol, price, z))
-            log.info(f"{symbol} price={price:.4f} z={z:.2f} gk_vol={vol:.3f}%")
+
+def startup_selftest():
+    """Verifies the Testnet pipeline END-TO-END at startup, instead of
+    discovering a broken connection only when the first real signal
+    fires. Reports the result to Telegram either way."""
         except requests.RequestException as e:
             log.error(f"Failed to fetch {symbol} this cycle: {e}")
 
@@ -251,14 +372,27 @@ def run_cycle():
         sent = send_telegram_message(report)
         log.info(f"Combined report sent: {sent}")
 
+    # Chart on ENTERING the buy zone (a transition), not on every cycle
+    # spent inside it — otherwise a long dip would spam identical charts.
+    for symbol, price, z, candles in per_symbol_data:
+        now_in_zone = z < -Z_THRESHOLD
+        was_in_zone = _in_buy_zone.get(symbol, False)
+        if now_in_zone and not was_in_zone:
+            pos = load_position(symbol)
+            send_chart(
+                symbol, candles,
+                f"{symbol}: Z = {z:.2f} entered the buy zone (< -{Z_THRESHOLD}).\n"
+                f"Statistical signal only - not advice.",
+                entry_price=pos["entry_price"] if pos else None,
+            )
+        _in_buy_zone[symbol] = now_in_zone
+
     if EXECUTION_ENABLED:
         # BTC only: the backtested, validated buy-side edge. Other coins
-        # are alert-only for now until each is individually backtested —
-        # this is deliberate, not a bug (see our earlier discussion about
-        # not extending an unvalidated signal to more assets).
-        for symbol, price, z in per_symbol_data:
+        # are alert-only until each is individually backtested.
+        for symbol, price, z, candles in per_symbol_data:
             if symbol == "BTCUSDT":
-                run_execution_step(symbol, price, z)
+                run_execution_step(symbol, price, z, candles)
     else:
         log.info("[EXEC] Testnet keys not set — execution layer disabled, alerts only.")
 
@@ -269,6 +403,8 @@ def main():
         f"Starting quant_alert for {', '.join(SYMBOLS)} ({INTERVAL}), polling every {POLL_SECONDS}s. "
         f"Testnet execution: {'ENABLED' if EXECUTION_ENABLED else 'disabled'}"
     )
+    if EXECUTION_ENABLED:
+        startup_selftest()
     while True:
         try:
             run_cycle()
