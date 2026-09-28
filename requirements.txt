@@ -1,2 +1,3 @@
-requests
-numpy
+الطلبات
+نمباي
+matplotlib
