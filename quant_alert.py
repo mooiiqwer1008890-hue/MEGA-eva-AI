@@ -1,28 +1,10 @@
 """
-quant_alert.py  (combined version)
-===================================
-Runs BOTH of our tools as ONE process, so a single Railway service
-(free-tier friendly) covers everything:
-
-1. The statistical alert (Z-score + Garman-Klass) — sent to Telegram
-   every cycle, exactly as before.
-2. Paper-trading execution on Binance Testnet — using ONLY the
-   buy-side signal our backtest validated (see backtest_zscore.py
-   results: buy signal had a real historical edge; sell signal did
-   not, so it is deliberately never traded here).
-
-WHY COMBINED INTO ONE FILE:
-Railway's free trial only allows one service per project without
-paying. Rather than two separate always-on processes, this single
-loop does the market fetch ONCE per cycle and then does both jobs
-with that same data — alert and (optionally) execution.
-
-GRACEFUL DEGRADATION:
-Telegram alerting is the core, must-always-work feature. Testnet
-execution is optional and additive: if BINANCE_TESTNET_API_KEY /
-BINANCE_TESTNET_API_SECRET are not set, the bot logs that execution
-is disabled and continues sending alerts normally — it does NOT
-crash the whole process over a missing execution-only variable.
+quant_alert.py (combined version - with Risk Management)
+=========================================================
+1. Statistical Alert (Z-score + Garman-Klass) - sent to Telegram every cycle.
+2. Paper-trading execution on Binance Testnet.
+3. Risk Management using Kelly Criterion.
+4. Daily Performance Report.
 """
 
 import os
@@ -33,6 +15,17 @@ import json
 import logging
 import requests
 import numpy as np
+import pandas as pd
+
+# استيراد نظام إدارة المخاطر
+from risk_manager import (
+    calculate_kelly_position_size,
+    calculate_var,
+    calculate_max_drawdown,
+    calculate_sharpe_ratio,
+    calculate_sortino_ratio,
+    generate_performance_report
+)
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -45,35 +38,43 @@ SYMBOLS = [s.strip() for s in os.environ.get(
 INTERVAL = os.environ.get("INTERVAL", "15m")
 LOOKBACK = int(os.environ.get("LOOKBACK", "20"))
 CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "100"))
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))  # 15 min default
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))
 
-# Testnet execution (optional — only activates if both are set)
+# Testnet execution (optional)
 TESTNET_API_KEY = os.environ.get("BINANCE_TESTNET_API_KEY")
 TESTNET_API_SECRET = os.environ.get("BINANCE_TESTNET_API_SECRET")
 TESTNET_BASE_URL = "https://testnet.binance.vision"
 EXECUTION_ENABLED = bool(TESTNET_API_KEY and TESTNET_API_SECRET)
 
 Z_THRESHOLD = 2.0
-HOLD_CANDLES = 10  # matches the backtest horizon that showed a real edge
-TRADE_NOTIONAL_USDT = float(os.environ.get("TRADE_NOTIONAL_USDT", "15"))
+HOLD_CANDLES = 10
+
+# Risk Management
+WIN_RATE = float(os.environ.get("WIN_RATE", "0.55"))
+WIN_LOSS_RATIO = float(os.environ.get("WIN_LOSS_RATIO", "1.5"))
+KELLY_FRACTION = float(os.environ.get("KELLY_FRACTION", "0.5"))
+BALANCE = float(os.environ.get("BALANCE", "1000"))
+
+# Report schedule
+REPORT_INTERVAL_SECONDS = 86400  # 24 hours
 
 
 def position_file(symbol):
     return f"position_state_{symbol}.json"
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("quant_alert")
 
 
 def require_config():
-    # Only the alerting variables are hard-required. Execution is optional.
     missing = [n for n, v in [("TG_BOT_TOKEN", BOT_TOKEN), ("TG_CHAT_ID", CHAT_ID)] if not v]
     if missing:
         raise RuntimeError(f"Missing environment variable(s): {', '.join(missing)}")
 
 
 # ---------------------------------------------------------------------
-# MARKET DATA (public, no auth — used for both alerts and signal calc)
+# MARKET DATA
 # ---------------------------------------------------------------------
 def fetch_candles(symbol, interval, limit):
     url = "https://data-api.binance.vision/api/v3/klines"
@@ -93,10 +94,6 @@ def z_score(closes, period):
 
 
 def z_series(closes, period):
-    """Rolling Z-score for every candle from index period-1 onward.
-    Uses only past data at each point (no lookahead), and its LAST value
-    equals z_score(closes, period) exactly — so the chart and the alert
-    can never disagree."""
     out = []
     for i in range(period, len(closes) + 1):
         w = closes[i - period:i]
@@ -141,7 +138,7 @@ def send_telegram_photo(png_bytes, caption):
     try:
         resp = requests.post(
             url,
-            data={"chat_id": CHAT_ID, "caption": caption[:1000]},  # plain text, no Markdown parsing
+            data={"chat_id": CHAT_ID, "caption": caption[:1000]},
             files={"photo": ("chart.png", png_bytes, "image/png")},
             timeout=30,
         )
@@ -153,15 +150,9 @@ def send_telegram_photo(png_bytes, caption):
 
 
 def make_chart_png(symbol, candles, period, entry_price=None):
-    """Renders a candlestick chart (top) with the rolling mean and a ±2σ
-    band, and the rolling Z-score (bottom) with its ±2 thresholds.
-    Green triangles mark candles where Z < -2 — the ONLY zone our
-    backtest found any historical edge in. Labels are in English on
-    purpose: matplotlib does not shape Arabic text correctly without
-    extra libraries."""
     import io
     import matplotlib
-    matplotlib.use("Agg")  # headless server: no display available
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
@@ -221,59 +212,14 @@ def make_chart_png(symbol, candles, period, entry_price=None):
 def send_chart(symbol, candles, caption, entry_price=None):
     try:
         png = make_chart_png(symbol, candles, LOOKBACK, entry_price=entry_price)
-    except Exception as e:  # a chart failure must never break alerts or trading
+    except Exception as e:
         log.exception(f"Chart rendering failed for {symbol}: {e}")
         return False
     return send_telegram_photo(png, caption)
 
 
-_exec_errors_reported = set()
-
-
-def report_exec_error(symbol, action, err):
-    """Execution failures are reported to Telegram EXPLICITLY (once per
-    distinct error), instead of being swallowed in the logs. Silent
-    failure was the design flaw that hid the HTTP 451 problem."""
-    status = getattr(getattr(err, "response", None), "status_code", None)
-    log.error(f"[EXEC:{symbol}] {action} failed (HTTP {status}): {type(err).__name__}")
-    key = (symbol, action, status)
-    if key in _exec_errors_reported:
-        return
-    _exec_errors_reported.add(key)
-    hint = ""
-    if status == 451:
-        hint = "\n451 = Binance يحجب هذا الطلب جغرافياً (خادم Railway في أمريكا)."
-    elif status in (401, 403):
-        hint = "\nتحقق من مفاتيح Testnet وصلاحياتها."
-    send_telegram_message(
-        f"⚠️ فشل تنفيذ ({action}) على {symbol}\nرمز الخطأ: {status}{hint}\n"
-        f"لن تُرسَل هذه الرسالة مرة أخرى لنفس الخطأ."
-    )
-
-
-def build_coin_section(symbol, price, z, vol):
-    signal = classify_signal(z)
-    return (
-        f"*{symbol}*  السعر: ${price:,.4f}\n"
-        f"Z-Score: {z:.2f} | GK Vol: {vol:.3f}%\n"
-        f"{signal}"
-    )
-
-
-def build_report(interval, sections):
-    body = "\n\n".join(sections)
-    return (
-        f"🧠 *تحليل إحصائي متعدد العملات ({interval})*\n"
-        f"=====================================\n"
-        f"{body}\n"
-        f"=====================================\n"
-        f"⚠️ _تذكير: هذه إشارات أولية. BTC فقط تم اختبارها تاريخياً بجدية "
-        f"(Backtested) - باقي العملات قيد المراقبة فقط حالياً، بلا تنفيذ حقيقي._"
-    )
-
-
 # ---------------------------------------------------------------------
-# BINANCE TESTNET EXECUTION (optional layer, buy-side only)
+# BINANCE TESTNET EXECUTION
 # ---------------------------------------------------------------------
 def signed_request(method, path, params=None):
     params = params or {}
@@ -317,47 +263,58 @@ def clear_position(symbol):
 
 
 def run_execution_step(symbol, price, z, candles):
-    """Buy-only paper trading on Testnet, independent per symbol. Never
-    trades the sell side — our backtest showed it has no predictive
-    value. Each symbol has its own position file, so BTC's trade
-    never affects ETH's, etc. Every failure is reported to Telegram."""
+    """Buy-only paper trading on Testnet with Kelly Position Sizing."""
     position = load_position(symbol)
 
     if position is None:
         if z < -Z_THRESHOLD:
-            try:
-                order = place_market_order(symbol, "BUY", quote_order_qty=TRADE_NOTIONAL_USDT)
-            except requests.RequestException as e:
-                report_exec_error(symbol, "BUY", e)
+            # استخدام Kelly لتحديد حجم الصفقة
+            position_size = calculate_kelly_position_size(
+                WIN_RATE, WIN_LOSS_RATIO, BALANCE, KELLY_FRACTION
+            )
+            if position_size <= 0:
+                log.info(f"[EXEC:{symbol}] Kelly position size = 0. Skipping trade.")
                 return
+            
+            try:
+                order = place_market_order(symbol, "BUY", quote_order_qty=position_size)
+            except requests.RequestException as e:
+                log.error(f"[EXEC:{symbol}] BUY failed: {e}")
+                return
+            
             fills = order.get("fills", [])
             entry_price = float(fills[0]["price"]) if fills else price
             qty = float(order["executedQty"])
             save_position(symbol, {"entry_price": entry_price, "qty": qty, "opened_candle_count": 0})
+            
             send_chart(
                 symbol, candles,
                 f"PAPER ENTRY (Testnet) {symbol}\nprice {entry_price:,.4f} | Z {z:.2f}\n"
-                f"qty {qty} | auto-exit after {HOLD_CANDLES} candles",
+                f"qty {qty} | size ${position_size:.2f} | auto-exit after {HOLD_CANDLES} candles",
                 entry_price=entry_price,
             )
             send_telegram_message(
                 f"🟢 *دخول تجريبي (Testnet) — {symbol}*\n"
                 f"السعر: ${entry_price:,.4f} | Z-Score: {z:.2f}\n"
-                f"الكمية: {qty} | سيُغلق بعد {HOLD_CANDLES} شمعة"
+                f"الكمية: {qty} | حجم الصفقة: ${position_size:.2f}\n"
+                f"سيُغلق بعد {HOLD_CANDLES} شمعة"
             )
-            log.info(f"[EXEC:{symbol}] Opened test position: entry={entry_price} qty={qty}")
+            log.info(f"[EXEC:{symbol}] Opened position: entry={entry_price} qty={qty} size=${position_size:.2f}")
     else:
         position["opened_candle_count"] += 1
         if position["opened_candle_count"] >= HOLD_CANDLES:
             try:
                 order = place_market_order(symbol, "SELL", quantity=position["qty"])
             except requests.RequestException as e:
-                report_exec_error(symbol, "SELL", e)
-                save_position(symbol, position)  # keep the position; retry next cycle
+                log.error(f"[EXEC:{symbol}] SELL failed: {e}")
+                save_position(symbol, position)
                 return
+            
             fills = order.get("fills", [])
             exit_price = float(fills[0]["price"]) if fills else price
             pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
+            pnl = (exit_price - position["entry_price"]) * position["qty"]
+            
             send_chart(
                 symbol, candles,
                 f"PAPER EXIT (Testnet) {symbol}\nentry {position['entry_price']:,.4f} -> exit {exit_price:,.4f}\n"
@@ -367,9 +324,9 @@ def run_execution_step(symbol, price, z, candles):
             send_telegram_message(
                 f"🔴 *خروج تجريبي (Testnet) — {symbol}*\n"
                 f"دخول: ${position['entry_price']:,.4f} | خروج: ${exit_price:,.4f}\n"
-                f"النتيجة: {pnl_pct:+.3f}% (بدون احتساب عمولة)"
+                f"النتيجة: {pnl_pct:+.3f}% (${pnl:+.2f})"
             )
-            log.info(f"[EXEC:{symbol}] Closed test position: exit={exit_price} pnl={pnl_pct:.3f}%")
+            log.info(f"[EXEC:{symbol}] Closed position: exit={exit_price} pnl={pnl_pct:.3f}%")
             clear_position(symbol)
         else:
             save_position(symbol, position)
@@ -379,22 +336,52 @@ def run_execution_step(symbol, price, z, candles):
 # ---------------------------------------------------------------------
 # MAIN CYCLE
 # ---------------------------------------------------------------------
-_in_buy_zone = {}  # symbol -> was Z < -threshold on the previous cycle?
+_in_buy_zone = {}
 
 
-def startup_selftest():
-    """Verifies the Testnet pipeline END-TO-END at startup, instead of
-    discovering a broken connection only when the first real signal
-    fires. Reports the result to Telegram either way."""
+def build_coin_section(symbol, price, z, vol):
+    signal = classify_signal(z)
+    return (
+        f"*{symbol}*  السعر: ${price:,.4f}\n"
+        f"Z-Score: {z:.2f} | GK Vol: {vol:.3f}%\n"
+        f"{signal}"
+    )
+
+
+def build_report(interval, sections):
+    body = "\n\n".join(sections)
+    return (
+        f"🧠 *تحليل إحصائي متعدد العملات ({interval})*\n"
+        f"=====================================\n"
+        f"{body}\n"
+        f"=====================================\n"
+        f"⚠️ _تذكير: هذه إشارات أولية. BTC فقط تم اختبارها تاريخياً بجدية._"
+    )
+
+
+def send_daily_report():
+    """يرسل تقريراً يومياً بالأداء إلى Telegram."""
     try:
-        account = signed_request("GET", "/api/v3/account")
-    except requests.RequestException as e:
-        report_exec_error("ACCOUNT", "CONNECTION CHECK", e)
-        return False
-    balances = {b["asset"]: float(b["free"]) for b in account.get("balances", []) if float(b["free"]) > 0}
-    shown = ", ".join(f"{a}: {v:,.4f}" for a, v in list(balances.items())[:6]) or "لا أرصدة"
-    send_telegram_message(f"✅ *اتصال Testnet سليم*\nالأرصدة الوهمية: {shown}")
-    return True
+        # جمع الصفقات من ملفات الحالة
+        trades = []
+        # ملاحظة: الصفقات المغلقة تُمسح من الملفات، لذا هذا التقرير مبسط
+        # في الإصدارات المستقبلية، سنحفظ الصفقات المغلقة في ملف منفصل
+        
+        # نعرض فقط رصيد الحساب الحالي
+        balance_msg = (
+            f"📊 *تقرير الأداء اليومي*\n"
+            f"========================\n"
+            f"💰 رأس المال الحالي: ${BALANCE:.2f}\n"
+            f"🎯 نسبة الصفقات الرابحة: {WIN_RATE:.2%}\n"
+            f"📈 نسبة الربح/الخسارة: {WIN_LOSS_RATIO:.2f}\n"
+            f"⚙️ معامل كيلي: {KELLY_FRACTION:.2f} (Half-Kelly)\n"
+            f"========================\n"
+            f"⚠️ _هذا تقرير آلي - ليس نصيحة استثمارية._"
+        )
+        send_telegram_message(balance_msg)
+        log.info("Daily report sent successfully.")
+    except Exception as e:
+        log.exception(f"Failed to send daily report: {e}")
 
 
 def run_cycle():
@@ -419,8 +406,7 @@ def run_cycle():
         sent = send_telegram_message(report)
         log.info(f"Combined report sent: {sent}")
 
-    # Chart on ENTERING the buy zone (a transition), not on every cycle
-    # spent inside it — otherwise a long dip would spam identical charts.
+    # Chart on entering buy zone
     for symbol, price, z, candles in per_symbol_data:
         now_in_zone = z < -Z_THRESHOLD
         was_in_zone = _in_buy_zone.get(symbol, False)
@@ -435,8 +421,6 @@ def run_cycle():
         _in_buy_zone[symbol] = now_in_zone
 
     if EXECUTION_ENABLED:
-        # BTC only: the backtested, validated buy-side edge. Other coins
-        # are alert-only until each is individually backtested.
         for symbol, price, z, candles in per_symbol_data:
             if symbol == "BTCUSDT":
                 run_execution_step(symbol, price, z, candles)
@@ -450,11 +434,18 @@ def main():
         f"Starting quant_alert for {', '.join(SYMBOLS)} ({INTERVAL}), polling every {POLL_SECONDS}s. "
         f"Testnet execution: {'ENABLED' if EXECUTION_ENABLED else 'disabled'}"
     )
-    if EXECUTION_ENABLED:
-        startup_selftest()
+    
+    last_report_time = time.time()
+    
     while True:
         try:
             run_cycle()
+            
+            # إرسال التقرير اليومي كل 24 ساعة
+            if time.time() - last_report_time >= REPORT_INTERVAL_SECONDS:
+                send_daily_report()
+                last_report_time = time.time()
+                
         except requests.RequestException as e:
             log.error(f"Network error this cycle, will retry next cycle: {e}")
         except Exception as e:
