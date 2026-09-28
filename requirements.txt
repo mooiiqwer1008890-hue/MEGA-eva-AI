@@ -6,3 +6,4 @@ scipy
 statsmodels
 hmmlearn
 arch
+vaderSentiment
