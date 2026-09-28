@@ -1,10 +1,11 @@
 """
-quant_alert.py (combined version - Paper Trading)
-==================================================
+quant_alert.py (combined version - with HMM Regime Detection)
+==============================================================
 1. Statistical Alert (Z-score + Garman-Klass) - sent to Telegram.
 2. Paper Trading (local simulation) via paper_trader.py.
 3. Risk Management via Kelly Criterion.
-4. Daily Performance Report.
+4. HMM Regime Detection - filter trades in Bear markets.
+5. Daily Performance Report.
 """
 
 import os
@@ -28,6 +29,11 @@ from paper_trader import (
     get_stats,
     TRADES_LOG,
 )
+from hmm_regime import (
+    detect_regimes,
+    get_current_regime,
+    filter_signals_by_regime,
+)
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -39,8 +45,14 @@ SYMBOLS = [s.strip() for s in os.environ.get(
 ).split(",") if s.strip()]
 INTERVAL = os.environ.get("INTERVAL", "15m")
 LOOKBACK = int(os.environ.get("LOOKBACK", "20"))
-CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "100"))
+CANDLE_LIMIT = int(os.environ.get("CANDLE_LIMIT", "200"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))
+
+# HMM Config
+HMM_INTERVAL = os.environ.get("HMM_INTERVAL", "4h")
+HMM_LIMIT = int(os.environ.get("HMM_LIMIT", "500"))
+HMM_STATES = int(os.environ.get("HMM_STATES", "2"))
+USE_HMM_FILTER = os.environ.get("USE_HMM_FILTER", "true").lower() == "true"
 
 Z_THRESHOLD = 2.0
 REPORT_INTERVAL_SECONDS = 86400  # 24 hours
@@ -62,6 +74,7 @@ def require_config():
 # MARKET DATA
 # ---------------------------------------------------------------------
 def fetch_candles(symbol, interval, limit):
+    """يجلب الشموع من Binance Data API."""
     url = "https://data-api.binance.vision/api/v3/klines"
     resp = requests.get(
         url,
@@ -71,6 +84,21 @@ def fetch_candles(symbol, interval, limit):
     resp.raise_for_status()
     raw = resp.json()
     return np.array([[float(k[1]), float(k[2]), float(k[3]), float(k[4])] for k in raw])
+
+
+def fetch_closes(symbol, interval="4h", limit=500):
+    """يجلب أسعار الإغلاق فقط (لـ HMM)."""
+    url = "https://data-api.binance.vision/api/v3/klines"
+    resp = requests.get(
+        url,
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    closes = pd.Series([float(k[4]) for k in raw])
+    returns = np.log(closes / closes.shift(1)).dropna()
+    return returns
 
 
 # ---------------------------------------------------------------------
@@ -109,6 +137,33 @@ def classify_signal(z):
 
 
 # ---------------------------------------------------------------------
+# HMM REGIME DETECTION
+# ---------------------------------------------------------------------
+def get_market_regime(symbol):
+    """
+    يحصل على النظام الحالي للسوق (Bull/Bear) باستخدام HMM.
+    """
+    if not USE_HMM_FILTER:
+        return {"current_regime": "Bull", "regime_prob": 1.0}
+
+    try:
+        returns = fetch_closes(symbol, interval=HMM_INTERVAL, limit=HMM_LIMIT)
+        if len(returns) < 100:
+            log.warning(f"[HMM:{symbol}] Not enough data ({len(returns)}). Skipping filter.")
+            return {"current_regime": "Bull", "regime_prob": 1.0}
+
+        result = get_current_regime(returns, n_states=HMM_STATES)
+        log.info(
+            f"[HMM:{symbol}] Regime={result['current_regime']} "
+            f"(prob={result['regime_prob']:.2%})"
+        )
+        return result
+    except Exception as e:
+        log.exception(f"[HMM:{symbol}] Failed: {e}")
+        return {"current_regime": "Bull", "regime_prob": 1.0}
+
+
+# ---------------------------------------------------------------------
 # TELEGRAM
 # ---------------------------------------------------------------------
 def send_telegram_message(text):
@@ -142,7 +197,7 @@ def send_telegram_photo(png_bytes, caption):
         return False
 
 
-def make_chart_png(symbol, candles, period, entry_price=None):
+def make_chart_png(symbol, candles, period, entry_price=None, regime=None):
     import io
     import matplotlib
     matplotlib.use("Agg")
@@ -185,7 +240,12 @@ def make_chart_png(symbol, candles, period, entry_price=None):
     if entry_price:
         ax1.axhline(entry_price, color="#00e676", linestyle="--", linewidth=1.3, label=f"Entry {entry_price:,.4f}")
 
-    ax1.set_title(f"{symbol}  {INTERVAL}  |  last price {c[-1]:,.4f}  |  Z = {zs[-1]:.2f}", color=fg)
+    # إضافة النظام إلى العنوان
+    regime_text = f" | Regime: {regime}" if regime else ""
+    ax1.set_title(
+        f"{symbol}  {INTERVAL}  |  last price {c[-1]:,.4f}  |  Z = {zs[-1]:.2f}{regime_text}",
+        color=fg
+    )
     ax1.legend(loc="upper left", facecolor=bg, edgecolor="#2a2e39", labelcolor=fg, fontsize=8)
 
     ax2.plot(zx, zs, color="#42a5f5", linewidth=1.2)
@@ -202,9 +262,9 @@ def make_chart_png(symbol, candles, period, entry_price=None):
     return buf.getvalue()
 
 
-def send_chart(symbol, candles, caption, entry_price=None):
+def send_chart(symbol, candles, caption, entry_price=None, regime=None):
     try:
-        png = make_chart_png(symbol, candles, LOOKBACK, entry_price=entry_price)
+        png = make_chart_png(symbol, candles, LOOKBACK, entry_price=entry_price, regime=regime)
     except Exception as e:
         log.exception(f"Chart rendering failed for {symbol}: {e}")
         return False
@@ -212,19 +272,40 @@ def send_chart(symbol, candles, caption, entry_price=None):
 
 
 # ---------------------------------------------------------------------
-# EXECUTION (Paper Trading)
+# EXECUTION (Paper Trading + HMM Filter)
 # ---------------------------------------------------------------------
 def run_execution_step(symbol, price, z, candles):
-    """تشغيل منطق التداول الورقي."""
+    """تشغيل منطق التداول الورقي مع فلتر HMM."""
     position = None
     pos_file = f"paper_position_{symbol}.json"
     if os.path.exists(pos_file):
         with open(pos_file) as f:
             position = json.load(f)
 
+    # الحصول على النظام الحالي
+    regime_info = get_market_regime(symbol)
+    current_regime = regime_info["current_regime"]
+
     if position is None:
         # فتح صفقة جديدة إذا Z < -2
         if z < -Z_THRESHOLD:
+            # فلترة الإشارة بواسطة HMM
+            signal = filter_signals_by_regime(1, current_regime)
+
+            if signal == 0:
+                log.info(
+                    f"[EXEC:{symbol}] Buy signal BLOCKED by HMM "
+                    f"(Regime={current_regime})"
+                )
+                send_telegram_message(
+                    f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
+                    f"Z-Score: {z:.2f} (منطقة الشراء)\n"
+                    f"النظام: *{current_regime}*\n"
+                    f"_HMM يمنع الشراء في السوق الهابط._"
+                )
+                return
+
+            # تنفيذ الصفقة
             new_pos = open_paper_position(symbol, price, z)
             if new_pos is None:
                 return
@@ -234,8 +315,9 @@ def run_execution_step(symbol, price, z, candles):
                 f"PAPER ENTRY {symbol}\nprice {new_pos['entry_price']:,.4f} | Z {z:.2f}\n"
                 f"qty {new_pos['quantity']:.6f} | size ${new_pos['position_size_usd']:.2f}\n"
                 f"SL {new_pos['stop_loss']:,.4f} | TP {new_pos['take_profit']:,.4f}\n"
-                f"Balance: ${balance:.2f}",
+                f"Balance: ${balance:.2f} | Regime: {current_regime}",
                 entry_price=new_pos['entry_price'],
+                regime=current_regime,
             )
             send_telegram_message(
                 f"🟢 *فتح صفقة (Paper) — {symbol}*\n"
@@ -244,7 +326,7 @@ def run_execution_step(symbol, price, z, candles):
                 f"حجم الصفقة: ${new_pos['position_size_usd']:.2f} (Kelly)\n"
                 f"وقف الخسارة: ${new_pos['stop_loss']:,.4f}\n"
                 f"هدف الربح: ${new_pos['take_profit']:,.4f}\n"
-                f"الرصيد: ${balance:.2f}"
+                f"النظام: *{current_regime}* | الرصيد: ${balance:.2f}"
             )
     else:
         # إدارة الصفقة المفتوحة
@@ -258,6 +340,7 @@ def run_execution_step(symbol, price, z, candles):
                 f"P&L {trade['pnl_pct']:+.3f}% (${trade['pnl_usd']:+.4f})\n"
                 f"Balance: ${balance:.2f}",
                 entry_price=trade['entry_price'],
+                regime=current_regime,
             )
             emoji = "🟢" if trade['pnl_usd'] > 0 else "🔴"
             send_telegram_message(
@@ -282,17 +365,6 @@ def build_coin_section(symbol, price, z, vol):
         f"*{symbol}*  السعر: ${price:,.4f}\n"
         f"Z-Score: {z:.2f} | GK Vol: {vol:.3f}%\n"
         f"{signal}"
-    )
-
-
-def build_report(interval, sections):
-    body = "\n\n".join(sections)
-    return (
-        f"🧠 *تحليل إحصائي متعدد العملات ({interval})*\n"
-        f"=====================================\n"
-        f"{body}\n"
-        f"=====================================\n"
-        f"⚠️ _تذكير: هذه إشارات آلية. التداول وهمي (Paper)._"
     )
 
 
@@ -325,7 +397,6 @@ def send_daily_report():
 
 
 def run_cycle():
-    sections = []
     per_symbol_data = []
 
     for symbol in SYMBOLS:
@@ -335,24 +406,29 @@ def run_cycle():
             price = closes[-1]
             z = z_score(closes, LOOKBACK)
             vol = garman_klass_volatility(candles, LOOKBACK)
-            sections.append(build_coin_section(symbol, price, z, vol))
             per_symbol_data.append((symbol, price, z, candles))
             log.info(f"{symbol} price={price:.4f} z={z:.2f} gk_vol={vol:.3f}%")
         except requests.RequestException as e:
             log.error(f"Failed to fetch {symbol} this cycle: {e}")
 
-    if sections:
-        report = build_report(INTERVAL, sections)
-        send_telegram_message(report)
-
-    # Chart on entering buy zone
+    # Chart & Alert on entering buy zone
     for symbol, price, z, candles in per_symbol_data:
         now_in_zone = z < -Z_THRESHOLD
         was_in_zone = _in_buy_zone.get(symbol, False)
         if now_in_zone and not was_in_zone:
+            regime_info = get_market_regime(symbol)
             send_chart(
                 symbol, candles,
-                f"{symbol}: Z = {z:.2f} entered the buy zone (< -{Z_THRESHOLD}).",
+                f"{symbol}: Z = {z:.2f} entered the buy zone (< -{Z_THRESHOLD}).\n"
+                f"Regime: {regime_info['current_regime']}\n"
+                f"Statistical signal only - not advice.",
+                regime=regime_info['current_regime'],
+            )
+            send_telegram_message(
+                f"🟢 *{symbol} دخل منطقة الشراء*\n"
+                f"السعر: ${price:,.4f} | Z: {z:.2f}\n"
+                f"النظام: *{regime_info['current_regime']}*\n"
+                f"⚠️ _إشارة إحصائية - Paper Trading قيد التنفيذ._"
             )
         _in_buy_zone[symbol] = now_in_zone
 
@@ -365,18 +441,21 @@ def main():
     require_config()
     balance = load_balance()
     log.info(
-        f"Starting quant_alert (Paper Trading) for {', '.join(SYMBOLS)} "
+        f"Starting quant_alert (Paper + HMM) for {', '.join(SYMBOLS)} "
         f"({INTERVAL}), polling every {POLL_SECONDS}s. Balance=${balance:.2f}"
     )
 
     send_telegram_message(
-        f"🚀 *البوت يعمل الآن (Paper Trading)*\n"
+        f"🚀 *البوت يعمل الآن (Paper + HMM)*\n"
         f"========================\n"
-        f"💰 الرصيد الابتدائي: ${balance:.2f}\n"
+        f"💰 الرصيد: ${balance:.2f}\n"
         f"📊 العملات: {', '.join(SYMBOLS)}\n"
         f"⏱️ الفترة: {INTERVAL}\n"
+        f"🧠 فلتر HMM: {'مُفعّل' if USE_HMM_FILTER else 'مُعطّل'}\n"
+        f"📊 HMM Interval: {HMM_INTERVAL} ({HMM_LIMIT} شمعة)\n"
         f"========================\n"
-        f"⚠️ _تداول وهمي - لا مخاطر مالية._"
+        f"⚠️ *تداول وهمي - لا مخاطر مالية.*\n"
+        f"📌 _HMM يمنع التداول في النظام Bear._"
     )
 
     last_report_time = time.time()
