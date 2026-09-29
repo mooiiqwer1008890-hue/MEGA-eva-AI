@@ -6,17 +6,9 @@ quant_alert.py (Fast + Full + HMM + GARCH + Sentiment + Correlation + FFC)
 1. Z-score < -2 (الإشارة الأساسية)
 2. HMM Regime (يجب Bull)
 3. GARCH Volatility (يجب غير HIGH)
-4. Sentiment (يجب غير BEARISH قوي)     ← CoinMarketCap Keyless API
+4. Sentiment (يجب غير BEARISH قوي) ← CoinMarketCap Keyless API (بدون API Key)
 5. Correlation (يجب غير مرتبط)
 6. FFC (يجب نشط)
-
-المصادر:
-- Successful Algorithmic Trading - QuantStart
-- Advanced Algorithmic Trading - Kaabar
-- Python Trader - Van Der Post
-- Professional Automated Trading - Durenard (FFC)
-- ML for Asset Managers - López de Prado (Correlation Filter)
-- Deep Learning for Finance - Kaabar (Sentiment)
 """
 
 import os
@@ -363,8 +355,7 @@ def _get_open_position_symbols():
 # -----------------------------------------------------------
 def run_execution_step(symbol, price, z, candles):
     """
-    تشغيل منطق التداول الورقي مع 6 فلاتر:
-    HMM + GARCH + Sentiment + Correlation + FFC
+    تشغيل منطق التداول الورقي مع 6 فلاتر.
     """
     # ═══ 0. FFC Check ═══
     if not ffc.can_open_position():
@@ -585,7 +576,6 @@ def run_cycle_full():
     if USE_SENTIMENT_FILTER:
         try:
             from news_fetcher import update_news_cache
-            # نجلب أخبار كل العملات معاً
             bases = [s.replace("USDT", "") for s in SYMBOLS]
             update_news_cache(symbols=bases)
             log.info("[FULL] تم تحديث news cache")
