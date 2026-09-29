@@ -1,27 +1,22 @@
 """
-quant_alert.py (Fast + Full Cycle + HMM + GARCH + Correlation + FFC + Sentiment)
-================================================================================
+quant_alert.py (Fast + Full + HMM + GARCH + Sentiment + Correlation + FFC)
+=========================================================================
 
-نظام متعدد الطبقات:
-1. فحص سريع (كل 5 دقائق): Z-Score + إشعار عاجل
-2. دورة كاملة (كل 30 دقيقة): HMM + GARCH + Sentiment + Correlation + FFC + التنفيذ
-3. تقرير يومي (كل 24 ساعة)
-
-الفلاتر (6 طبقات):
+النظام الكامل مع 6 طبقات حماية:
 1. Z-score < -2 (الإشارة الأساسية)
 2. HMM Regime (يجب Bull)
 3. GARCH Volatility (يجب غير HIGH)
-4. Sentiment (يجب غير BEARISH قوي)     ← 🆕 المرحلة 4
+4. Sentiment (يجب غير BEARISH قوي)     ← CoinMarketCap Keyless API
 5. Correlation (يجب غير مرتبط)
 6. FFC (يجب نشط)
 
 المصادر:
-- Successful Algorithmic Trading (Kelly, Risk Management)
-- Advanced Algorithmic Trading (HMM, GARCH)
-- Python Trader (Paper Trading)
+- Successful Algorithmic Trading - QuantStart
+- Advanced Algorithmic Trading - Kaabar
+- Python Trader - Van Der Post
 - Professional Automated Trading - Durenard (FFC)
 - ML for Asset Managers - López de Prado (Correlation Filter)
-- Deep Learning for Finance - Kaabar (NLP Sentiment)
+- Deep Learning for Finance - Kaabar (Sentiment)
 """
 
 import os
@@ -96,8 +91,7 @@ GARCH_INTERVAL = os.environ.get("GARCH_INTERVAL", "4h")
 GARCH_LIMIT = int(os.environ.get("GARCH_LIMIT", "500"))
 USE_GARCH_FILTER = os.environ.get("USE_GARCH_FILTER", "true").lower() == "true"
 
-# Sentiment Config
-CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
+# Sentiment Config (بدون API Key — CoinMarketCap Keyless)
 USE_SENTIMENT_FILTER = os.environ.get("USE_SENTIMENT_FILTER", "true").lower() == "true"
 
 Z_THRESHOLD = 2.0
@@ -372,9 +366,7 @@ def run_execution_step(symbol, price, z, candles):
     تشغيل منطق التداول الورقي مع 6 فلاتر:
     HMM + GARCH + Sentiment + Correlation + FFC
     """
-    # ═══════════════════════════════════════════════════════════
-    # 0. FFC Check — هل البوت نشط؟
-    # ═══════════════════════════════════════════════════════════
+    # ═══ 0. FFC Check ═══
     if not ffc.can_open_position():
         log.info(f"[EXEC:{symbol}] 🔴 FFC OFF — تم إيقاف التداول")
         return
@@ -392,9 +384,7 @@ def run_execution_step(symbol, price, z, candles):
     vol_ratio = vol_info["vol_ratio"]
     vol_regime = vol_info["vol_regime"]
 
-    # ═══════════════════════════════════════════════════════════
-    # إذا لم تكن هناك صفقة مفتوحة على هذه العملة
-    # ═══════════════════════════════════════════════════════════
+    # ═══ لا توجد صفقة مفتوحة ═══
     if position is None:
         if z < -Z_THRESHOLD:
             # ─── 1. HMM Filter ───
@@ -421,10 +411,10 @@ def run_execution_step(symbol, price, z, candles):
                 )
                 return
 
-            # ─── 3. Sentiment Filter (جديد) ───
+            # ─── 3. Sentiment Filter ───
             sentiment_multiplier = 1.0
             sentiment_info = {"label": "neutral", "score": 0.0, "count": 0}
-            if USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY:
+            if USE_SENTIMENT_FILTER:
                 sent_result = sentiment_filter.filter_signal("BUY", symbol)
                 sentiment_info = sent_result["sentiment"]
                 if not sent_result["allowed"]:
@@ -462,7 +452,6 @@ def run_execution_step(symbol, price, z, candles):
             if new_pos is None:
                 return
 
-            # تعديل الحجم حسب GARCH × Sentiment
             original_size = new_pos["position_size_usd"]
             garch_size = adjust_position_size_by_volatility(original_size, vol_ratio)
             final_size = garch_size * sentiment_multiplier
@@ -506,8 +495,6 @@ def run_execution_step(symbol, price, z, candles):
         trade = check_and_close_position(symbol, price)
         if trade:
             balance = load_balance()
-
-            # إبلاغ FFC بالصفقة
             ffc.update_after_trade(trade["pnl_usd"], balance)
 
             send_chart(
@@ -538,7 +525,7 @@ _in_buy_zone = {}
 
 
 def check_urgent_signals(per_symbol_data):
-    """يفحص الإشارات العاجلة (Z < -2.5 أو دخول منطقة الشراء)."""
+    """يفحص الإشارات العاجلة."""
     for symbol, price, z, candles in per_symbol_data:
         if z < -Z_STRONG_THRESHOLD:
             log.info(f"[URGENT:{symbol}] Strong buy signal z={z:.2f}")
@@ -564,7 +551,7 @@ def check_urgent_signals(per_symbol_data):
 
 
 def run_cycle_fast():
-    """دورة سريعة (كل 5 دقائق): جلب البيانات + فحص الإشارات العاجلة."""
+    """دورة سريعة (كل 5 دقائق)."""
     per_symbol_data = []
     for symbol in SYMBOLS:
         try:
@@ -582,10 +569,10 @@ def run_cycle_fast():
 
 
 def run_cycle_full():
-    """دورة كاملة (كل 30 دقيقة): HMM + GARCH + Sentiment + Correlation + FFC + التنفيذ."""
+    """دورة كاملة (كل 30 دقيقة) — كل الفلاتر."""
     per_symbol_data = []
 
-    # تحديث Correlation Filter بالبيانات الحديثة
+    # تحديث Correlation Filter
     for symbol in SYMBOLS:
         try:
             candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
@@ -594,11 +581,13 @@ def run_cycle_full():
         except Exception as e:
             log.warning(f"[FULL] فشل تحديث correlation لـ {symbol}: {e}")
 
-    # تحديث cache الأخبار (إذا Sentiment مفعل)
-    if USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY:
+    # تحديث cache الأخبار
+    if USE_SENTIMENT_FILTER:
         try:
             from news_fetcher import update_news_cache
-            update_news_cache()
+            # نجلب أخبار كل العملات معاً
+            bases = [s.replace("USDT", "") for s in SYMBOLS]
+            update_news_cache(symbols=bases)
             log.info("[FULL] تم تحديث news cache")
         except Exception as e:
             log.warning(f"[FULL] فشل تحديث news cache: {e}")
@@ -626,13 +615,12 @@ def send_daily_report():
         if stats is None:
             return
 
-        # حالة FFC
         ffc_info = ffc.status()
         ffc_emoji = "🟢" if ffc_info["is_live"] else "🔴"
 
         # حالة Sentiment
         sent_lines = []
-        if USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY:
+        if USE_SENTIMENT_FILTER:
             for symbol in SYMBOLS:
                 s = sentiment_filter.get_sentiment(symbol)
                 emoji = "🟢" if s["label"] == "bullish" else "🔴" if s["label"] == "bearish" else "⚪"
@@ -685,11 +673,7 @@ def main():
     require_config()
     balance = load_balance()
 
-    sentiment_status = (
-        "مفعل" if (USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY)
-        else "معطل (لا يوجد API Key)" if USE_SENTIMENT_FILTER
-        else "معطل يدوياً"
-    )
+    sentiment_status = "مفعل" if USE_SENTIMENT_FILTER else "معطل"
 
     log.info(
         f"Starting quant_alert (Full Stack) for {', '.join(SYMBOLS)} "
