@@ -1,18 +1,27 @@
 """
-quant_alert.py (Fast + Full Cycle + HMM + GARCH + Correlation + FFC)
-====================================================================
+quant_alert.py (Fast + Full Cycle + HMM + GARCH + Correlation + FFC + Sentiment)
+================================================================================
 
-نظام ثلاثي الطبقات:
+نظام متعدد الطبقات:
 1. فحص سريع (كل 5 دقائق): Z-Score + إشعار عاجل
-2. دورة كاملة (كل 30 دقيقة): HMM + GARCH + Correlation + FFC + التنفيذ
+2. دورة كاملة (كل 30 دقيقة): HMM + GARCH + Sentiment + Correlation + FFC + التنفيذ
 3. تقرير يومي (كل 24 ساعة)
+
+الفلاتر (6 طبقات):
+1. Z-score < -2 (الإشارة الأساسية)
+2. HMM Regime (يجب Bull)
+3. GARCH Volatility (يجب غير HIGH)
+4. Sentiment (يجب غير BEARISH قوي)     ← 🆕 المرحلة 4
+5. Correlation (يجب غير مرتبط)
+6. FFC (يجب نشط)
 
 المصادر:
 - Successful Algorithmic Trading (Kelly, Risk Management)
 - Advanced Algorithmic Trading (HMM, GARCH)
 - Python Trader (Paper Trading)
-- Professional Automated Trading - Durenard (FFC + Swarm Concept)
+- Professional Automated Trading - Durenard (FFC)
 - ML for Asset Managers - López de Prado (Correlation Filter)
+- Deep Learning for Finance - Kaabar (NLP Sentiment)
 """
 
 import os
@@ -48,13 +57,15 @@ from garch_model import (
 )
 
 # ═══════════════════════════════════════════════════════════════
-# 🆕 إضافات جديدة: Correlation Filter + FFC
+# إضافات: Correlation Filter + FFC + Sentiment Filter
 # ═══════════════════════════════════════════════════════════════
 from correlation_filter import get_correlation_filter
 from ffc import get_ffc
+from sentiment_filter import get_sentiment_filter
 
 correlation_filter = get_correlation_filter()
 ffc = get_ffc()
+sentiment_filter = get_sentiment_filter()
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -84,6 +95,10 @@ USE_HMM_FILTER = os.environ.get("USE_HMM_FILTER", "true").lower() == "true"
 GARCH_INTERVAL = os.environ.get("GARCH_INTERVAL", "4h")
 GARCH_LIMIT = int(os.environ.get("GARCH_LIMIT", "500"))
 USE_GARCH_FILTER = os.environ.get("USE_GARCH_FILTER", "true").lower() == "true"
+
+# Sentiment Config
+CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
+USE_SENTIMENT_FILTER = os.environ.get("USE_SENTIMENT_FILTER", "true").lower() == "true"
 
 Z_THRESHOLD = 2.0
 Z_STRONG_THRESHOLD = 2.5
@@ -354,7 +369,8 @@ def _get_open_position_symbols():
 # -----------------------------------------------------------
 def run_execution_step(symbol, price, z, candles):
     """
-    تشغيل منطق التداول الورقي مع HMM + GARCH + Correlation + FFC.
+    تشغيل منطق التداول الورقي مع 6 فلاتر:
+    HMM + GARCH + Sentiment + Correlation + FFC
     """
     # ═══════════════════════════════════════════════════════════
     # 0. FFC Check — هل البوت نشط؟
@@ -362,29 +378,29 @@ def run_execution_step(symbol, price, z, candles):
     if not ffc.can_open_position():
         log.info(f"[EXEC:{symbol}] 🔴 FFC OFF — تم إيقاف التداول")
         return
-    
+
     position = None
     pos_file = f"paper_position_{symbol}.json"
     if os.path.exists(pos_file):
         with open(pos_file) as f:
             position = json.load(f)
-    
+
     regime_info = get_market_regime(symbol)
     current_regime = regime_info["current_regime"]
-    
+
     vol_info = get_volatility_info(symbol)
     vol_ratio = vol_info["vol_ratio"]
     vol_regime = vol_info["vol_regime"]
-    
+
     # ═══════════════════════════════════════════════════════════
     # إذا لم تكن هناك صفقة مفتوحة على هذه العملة
     # ═══════════════════════════════════════════════════════════
     if position is None:
         if z < -Z_THRESHOLD:
-            # 1. HMM Filter
+            # ─── 1. HMM Filter ───
             signal = filter_signals_by_regime(1, current_regime)
             if signal == 0:
-                log.info(f"[EXEC:{symbol}] Buy signal BLOCKED by HMM ({current_regime})")
+                log.info(f"[EXEC:{symbol}] Buy BLOCKED by HMM ({current_regime})")
                 send_telegram_message(
                     f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
                     f"Z-Score: `{z:.2f}`\n"
@@ -392,10 +408,10 @@ def run_execution_step(symbol, price, z, candles):
                     f"_HMM يمنع الشراء في السوق الهابط._"
                 )
                 return
-            
-            # 2. GARCH Filter
+
+            # ─── 2. GARCH Filter ───
             if vol_regime == "HIGH" and vol_ratio > 2.0:
-                log.info(f"[EXEC:{symbol}] Buy signal BLOCKED by GARCH ({vol_regime})")
+                log.info(f"[EXEC:{symbol}] Buy BLOCKED by GARCH ({vol_regime})")
                 send_telegram_message(
                     f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
                     f"Z-Score: `{z:.2f}`\n"
@@ -404,14 +420,34 @@ def run_execution_step(symbol, price, z, candles):
                     f"_GARCH يمنع الشراء في التقلب المرتفع._"
                 )
                 return
-            
-            # ═══════════════════════════════════════════════════
-            # 3. Correlation Filter (🆕)
-            # ═══════════════════════════════════════════════════
+
+            # ─── 3. Sentiment Filter (جديد) ───
+            sentiment_multiplier = 1.0
+            sentiment_info = {"label": "neutral", "score": 0.0, "count": 0}
+            if USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY:
+                sent_result = sentiment_filter.filter_signal("BUY", symbol)
+                sentiment_info = sent_result["sentiment"]
+                if not sent_result["allowed"]:
+                    log.info(f"[EXEC:{symbol}] Buy BLOCKED by Sentiment: {sent_result['reason']}")
+                    send_telegram_message(
+                        f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
+                        f"Z-Score: `{z:.2f}`\n"
+                        f"السبب: *الأخبار سلبية*\n"
+                        f"`{sent_result['reason']}`\n"
+                        f"_Sentiment Filter يمنع الشراء في الأخبار السيئة._"
+                    )
+                    return
+                sentiment_multiplier = sent_result["multiplier"]
+                log.info(
+                    f"[EXEC:{symbol}] Sentiment OK: {sent_result['reason']} "
+                    f"(mult={sentiment_multiplier:.2f})"
+                )
+
+            # ─── 4. Correlation Filter ───
             open_symbols = _get_open_position_symbols()
             can_open, reason = correlation_filter.can_open_position(symbol, open_symbols)
             if not can_open:
-                log.info(f"[EXEC:{symbol}] Buy signal BLOCKED by Correlation: {reason}")
+                log.info(f"[EXEC:{symbol}] Buy BLOCKED by Correlation: {reason}")
                 send_telegram_message(
                     f"⚠️ *إشارة شراء مرفوضة — {symbol}*\n"
                     f"Z-Score: `{z:.2f}`\n"
@@ -420,27 +456,33 @@ def run_execution_step(symbol, price, z, candles):
                     f"_Correlation Filter يمنع الصفقات المترابطة._"
                 )
                 return
-            
+
             # ✅ كل الفلاتر نجحت — افتح الصفقة
             new_pos = open_paper_position(symbol, price, z)
             if new_pos is None:
                 return
-            
-            # تعديل الحجم حسب GARCH
+
+            # تعديل الحجم حسب GARCH × Sentiment
             original_size = new_pos["position_size_usd"]
-            adjusted_size = adjust_position_size_by_volatility(original_size, vol_ratio)
-            new_pos["quantity"] = adjusted_size / price
-            new_pos["position_size_usd"] = adjusted_size
-            
+            garch_size = adjust_position_size_by_volatility(original_size, vol_ratio)
+            final_size = garch_size * sentiment_multiplier
+            new_pos["quantity"] = final_size / price
+            new_pos["position_size_usd"] = final_size
+
             with open(pos_file, "w") as f:
                 json.dump(new_pos, f)
-            
+
             balance = load_balance()
+            sent_label = sentiment_info.get("label", "neutral")
+            sent_score = sentiment_info.get("score", 0.0)
+            sent_count = sentiment_info.get("count", 0)
+
             send_chart(
                 symbol, candles,
                 f"PAPER ENTRY {symbol}\n"
                 f"price {new_pos['entry_price']:.4f} | Z {z:.2f}\n"
-                f"qty {new_pos['quantity']:.6f} | size ${adjusted_size:.2f}\n"
+                f"qty {new_pos['quantity']:.6f} | size ${final_size:.2f}\n"
+                f"Sentiment: {sent_label} ({sent_score:+.2f}, {sent_count} news)\n"
                 f"Balance: ${balance:.2f} | {current_regime} | {vol_regime}",
                 entry_price=new_pos["entry_price"],
                 regime=current_regime,
@@ -450,24 +492,24 @@ def run_execution_step(symbol, price, z, candles):
                 f"🟢 *فتح صفقة (Paper) — {symbol}*\n"
                 f"السعر: `${new_pos['entry_price']:.4f}` | Z: `{z:.2f}`\n"
                 f"الكمية: `{new_pos['quantity']:.6f}`\n"
-                f"حجم الصفقة: `${adjusted_size:.2f}` (Kelly × {vol_regime})\n"
+                f"حجم الصفقة: `${final_size:.2f}`\n"
+                f"GARCH × Sentiment: `×{sentiment_multiplier:.2f}`\n"
                 f"النظام: *{current_regime}* | التقلب: *{vol_regime}*\n"
+                f"الأخبار: {sent_label} ({sent_score:+.2f}, {sent_count} items)\n"
                 f"الرصيد: `${balance:.2f}`"
             )
         else:
-            # لا إشارة
             pass
+
     else:
-        # ═══════════════════════════════════════════════════════
-        # صفقة موجودة — فكر في إغلاقها
-        # ═══════════════════════════════════════════════════════
+        # ─── صفقة موجودة — فكر في إغلاقها ───
         trade = check_and_close_position(symbol, price)
         if trade:
             balance = load_balance()
-            
-            # 🆕 إبلاغ FFC بالصفقة
+
+            # إبلاغ FFC بالصفقة
             ffc.update_after_trade(trade["pnl_usd"], balance)
-            
+
             send_chart(
                 symbol, candles,
                 f"PAPER EXIT {symbol} ({trade['exit_reason']})\n"
@@ -506,10 +548,10 @@ def check_urgent_signals(per_symbol_data):
                 f"السعر: `${price:.4f}`\n"
                 f"_إشارة شراء قوية._"
             )
-        
+
         now_in_zone = z < -Z_THRESHOLD
         was_in_zone = _in_buy_zone.get(symbol, False)
-        
+
         if now_in_zone and not was_in_zone:
             send_telegram_message(
                 f"🟢 *{symbol}* دخل منطقة الشراء\n"
@@ -517,7 +559,7 @@ def check_urgent_signals(per_symbol_data):
                 f"السعر: `${price:.4f}`\n"
                 f"_إشارة إحصائية - لا نصيحة._"
             )
-        
+
         _in_buy_zone[symbol] = now_in_zone
 
 
@@ -534,16 +576,16 @@ def run_cycle_fast():
             log.info(f"[FAST] {symbol} price={price:.4f} z={z:.2f}")
         except requests.RequestException as e:
             log.error(f"[FAST] Failed to fetch {symbol}: {e}")
-    
+
     if per_symbol_data:
         check_urgent_signals(per_symbol_data)
 
 
 def run_cycle_full():
-    """دورة كاملة (كل 30 دقيقة): HMM + GARCH + Correlation + FFC + التنفيذ."""
+    """دورة كاملة (كل 30 دقيقة): HMM + GARCH + Sentiment + Correlation + FFC + التنفيذ."""
     per_symbol_data = []
-    
-    # 🆕 تحديث Correlation Filter بالبيانات الحديثة
+
+    # تحديث Correlation Filter بالبيانات الحديثة
     for symbol in SYMBOLS:
         try:
             candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
@@ -551,7 +593,16 @@ def run_cycle_full():
             correlation_filter.update_prices(symbol, closes)
         except Exception as e:
             log.warning(f"[FULL] فشل تحديث correlation لـ {symbol}: {e}")
-    
+
+    # تحديث cache الأخبار (إذا Sentiment مفعل)
+    if USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY:
+        try:
+            from news_fetcher import update_news_cache
+            update_news_cache()
+            log.info("[FULL] تم تحديث news cache")
+        except Exception as e:
+            log.warning(f"[FULL] فشل تحديث news cache: {e}")
+
     for symbol in SYMBOLS:
         try:
             candles = fetch_candles(symbol, INTERVAL, CANDLE_LIMIT)
@@ -563,7 +614,7 @@ def run_cycle_full():
             log.info(f"[FULL] {symbol} price={price:.4f} z={z:.2f}")
         except requests.RequestException as e:
             log.error(f"[FULL] Failed to fetch {symbol}: {e}")
-    
+
     for symbol, price, z, candles in per_symbol_data:
         run_execution_step(symbol, price, z, candles)
 
@@ -574,11 +625,30 @@ def send_daily_report():
         stats = get_stats()
         if stats is None:
             return
-        
-        # 🆕 حالة FFC
+
+        # حالة FFC
         ffc_info = ffc.status()
         ffc_emoji = "🟢" if ffc_info["is_live"] else "🔴"
-        
+
+        # حالة Sentiment
+        sent_lines = []
+        if USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY:
+            for symbol in SYMBOLS:
+                s = sentiment_filter.get_sentiment(symbol)
+                emoji = "🟢" if s["label"] == "bullish" else "🔴" if s["label"] == "bearish" else "⚪"
+                sent_lines.append(
+                    f"   {emoji} {symbol}: {s['label']} "
+                    f"({s['score']:+.2f}, {s['count']} خبر)"
+                )
+            sent_summary = "\n".join(sent_lines) if sent_lines else "   (لا توجد بيانات)"
+            sent_section = (
+                f"════════════════════\n"
+                f"📰 *حالة الأخبار*\n"
+                f"{sent_summary}\n"
+            )
+        else:
+            sent_section = "📰 *Sentiment*: `معطل`\n"
+
         message = (
             f"📊 *التقرير اليومي للأداء*\n"
             f"════════════════════\n"
@@ -598,6 +668,8 @@ def send_daily_report():
             f"الأداء: `{ffc_info['fitness']:+.2f}%`\n"
             f"مرات الإيقاف: `{ffc_info['total_halts']}`\n"
             f"════════════════════\n"
+            f"{sent_section}"
+            f"════════════════════\n"
             f"⚠️ _تقرير آلي — ليس نصيحة استثمارية._"
         )
         send_telegram_message(message)
@@ -612,50 +684,60 @@ def send_daily_report():
 def main():
     require_config()
     balance = load_balance()
+
+    sentiment_status = (
+        "مفعل" if (USE_SENTIMENT_FILTER and CRYPTOPANIC_API_KEY)
+        else "معطل (لا يوجد API Key)" if USE_SENTIMENT_FILTER
+        else "معطل يدوياً"
+    )
+
     log.info(
-        f"Starting quant_alert (Fast + Full + Correlation + FFC) for {', '.join(SYMBOLS)} "
+        f"Starting quant_alert (Full Stack) for {', '.join(SYMBOLS)} "
         f"({INTERVAL}), fast every {FAST_POLL_SECONDS}s, "
         f"full every {POLL_SECONDS}s, "
-        f"Balance=${balance:.2f}"
+        f"Balance=${balance:.2f}, "
+        f"Sentiment={sentiment_status}"
     )
-    
+
     send_telegram_message(
-        f"🚀 *البوت يعمل الآن (Fast + Full + 🆕 Correlation + FFC)*\n"
+        f"🚀 *البوت يعمل الآن (Full Stack)*\n"
         f"════════════════════\n"
         f"💰 الرصيد: `${balance:.2f}`\n"
         f"📊 العملات: `{', '.join(SYMBOLS)}`\n"
         f"⏱ الفترة: `{INTERVAL}`\n"
         f"⚡ فحص سريع: كل `{FAST_POLL_SECONDS // 60}` دقيقة\n"
         f"🔄 دورة كاملة: كل `{POLL_SECONDS // 60}` دقيقة\n"
+        f"════════════════════\n"
         f"🧠 HMM: `{'مفعل' if USE_HMM_FILTER else 'معطل'}`\n"
         f"📉 GARCH: `{'مفعل' if USE_GARCH_FILTER else 'معطل'}`\n"
-        f"🔗 Correlation Filter: `مفعل`\n"
-        f"🛡 FFC (حماية): `مفعل`\n"
+        f"📰 Sentiment: `{sentiment_status}`\n"
+        f"🔗 Correlation: `مفعل`\n"
+        f"🛡 FFC: `مفعل`\n"
         f"════════════════════\n"
         f"⚠️ _تداول وهمي — لا مخاطر مالية._"
     )
-    
+
     last_full_cycle = time.time()
     last_report_time = time.time()
-    
+
     while True:
         try:
             run_cycle_fast()
-            
+
             if time.time() - last_full_cycle >= POLL_SECONDS:
-                log.info("[MAIN] Starting full cycle (HMM + GARCH + Correlation + FFC)")
+                log.info("[MAIN] Starting full cycle (HMM + GARCH + Sentiment + Correlation + FFC)")
                 run_cycle_full()
                 last_full_cycle = time.time()
-            
+
             if time.time() - last_report_time >= REPORT_INTERVAL_SECONDS:
                 send_daily_report()
                 last_report_time = time.time()
-        
+
         except requests.RequestException as e:
             log.error(f"Network error this cycle: {e}")
         except Exception as e:
             log.exception(f"Unexpected error this cycle: {e}")
-        
+
         time.sleep(FAST_POLL_SECONDS)
 
 
