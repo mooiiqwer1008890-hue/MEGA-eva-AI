@@ -1,0 +1,104 @@
+language: "ar"
+
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  review_status: true
+  poem: false
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_instructions:
+    - path: "**/*.py"
+      instructions: |
+        هذا مشروع MEGA-eva-AI — بوت تداول كمي يعمل على Binance + Telegram + Railway.
+        
+        افحص بعناية:
+        1. صحة المنطق المالي (Z-score، HMM، GARCH، Kelly)
+        2. إدارة المخاطر (Stop Loss، Take Profit، Position Sizing)
+        3. معالجة الأخطاء (try/except، fallback)
+        4. تدفق البيانات بين الملفات
+        5. عدم تكرار استدعاءات API بشكل مفرط
+        6. كفاءة الأداء (تجنب loops غير ضرورية)
+        
+        تحذير: أي خطأ في حساب الوقت أو المخاطر = خسارة مالية حقيقية.
+
+    - path: "quant_alert.py"
+      instructions: |
+        الملف الرئيسي. ركز على:
+        - ترتيب الفلاتر: HMM → GARCH → Sentiment → Correlation → FFC → Kelly
+        - معالجة Network Errors
+        - عدم إرسال رسائل Telegram مكررة
+        - صحة استدعاء paper_trader
+
+    - path: "paper_trader.py"
+      instructions: |
+        محاكي التداول. **حرج جداً**:
+        - حساب الوقت يجب أن يكون بالـ Timestamp وليس عدد الاستدعاءات
+        - أي خطأ في الوقت = خسارة مضاعفة
+        - صحة حساب PnL و balance
+
+    - path: "hmm_regime.py"
+      instructions: |
+        HMM Regime Detection. ركز على:
+        - سلامة syntax (imports صحيحة)
+        - fallback آمن عند الفشل
+        - عدم التعليق (timeout)
+
+    - path: "risk_manager.py"
+      instructions: |
+        إدارة المخاطر. **حرج جداً**:
+        - صحة حساب Kelly Position Size
+        - حدود Max Drawdown
+        - VaR calculation
+
+    - path: "correlation_filter.py"
+      instructions: |
+        فلتر الارتباط. ركز على:
+        - صحة مصفوفة الارتباط
+        - عدم رفض صفقات غير مترابطة (false positives)
+
+    - path: "ffc.py"
+      instructions: |
+        Fitness Feedback Control. ركز على:
+        - صحة حساب Fitness
+        - العتبات (PHI_ON، PHI_OFF)
+
+    - path: "sentiment_filter.py"
+      instructions: |
+        فلتر المشاعر. ركز على:
+        - صحة VADER + Crypto Lexicon
+        - عدم رفض عند قلة الأخبار
+
+  path_filters:
+    - "!**/*.csv"
+    - "!**/*.json"
+    - "!**/*.txt"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/__pycache__/**"
+    - "!**/.pytest_cache/**"
+
+  tools:
+    ruff:
+      enabled: true
+    pylint:
+      enabled: true
+    bandit:
+      enabled: true
+    markdownlint:
+      enabled: false
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  learnings:
+    scope: global
+  issues:
+    scope: global
