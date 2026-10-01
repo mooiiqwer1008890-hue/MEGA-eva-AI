@@ -1,9 +1,35 @@
-requests
-numpy
-matplotlib
-pandas
-scipy
-statsmodels
-hmmlearn
-arch
-vaderSentiment
+# ============================================================
+# MEGA Crypto Analysis / Paper-Trading System
+# Python dependencies
+# ============================================================
+
+# Core HTTP / networking
+requests>=2.32,<3
+urllib3>=2.2,<3
+
+# Binance Spot API client
+# Provides the `binance` Python module used by binance_client/live_trader
+python-binance==1.0.37
+
+# Numerical / data analysis
+numpy>=1.26,<3
+pandas>=2.2,<3
+scipy>=1.13,<2
+statsmodels>=0.14,<1
+
+# Visualization / Telegram chart generation
+matplotlib>=3.8,<4
+
+# Regime detection / ML research components
+hmmlearn>=0.3.3,<1
+scikit-learn>=1.5,<2
+
+# Volatility modelling
+arch>=7,<9
+
+# Sentiment analysis
+vaderSentiment>=3.3.2,<4
+
+# Environment-variable support for local development
+# Railway can continue using its native Environment Variables.
+python-dotenv>=1,<2
