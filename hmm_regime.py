@@ -1,119 +1,28 @@
 """
 hmm_regime.py
 =============
+MEGA Market Regime Detection Engine
 
-Advanced Market Regime Detection Engine
-using Gaussian Hidden Markov Models.
+Gaussian Hidden Markov Model (HMM) for market-regime classification.
 
-===========================================================
-WHAT THIS MODULE DOES
-===========================================================
+Design goals
+------------
+1. Keep backward compatibility with the current MEGA runtime.
+2. Fix the historical Series-input KeyError on ``range`` / ``volume_z``.
+3. Prefer real OHLCV features whenever a DataFrame is supplied.
+4. Remain usable when the caller only supplies log returns.
+5. Return a rich, explicit result for downstream risk/filter layers.
+6. Treat low-confidence regimes as UNKNOWN for safety.
 
-يكتشف حالة السوق الكامنة (Market Regime) باستخدام HMM.
+Important
+---------
+HMM is a regime/context model, not a standalone Buy/Sell predictor.
+A high-probability regime is not proof that the next price move will have
+any particular direction.
 
-بدلاً من استخدام Log Return وحده، يستخدم النموذج عدة خصائص:
-
-    1. Log Return
-    2. Realized Volatility
-    3. High-Low Range
-    4. Volume Z-Score
-    5. Momentum
-    6. Return Z-Score
-
-الحالات:
-
-    n_states=2
-        BEAR / BULL
-
-    n_states=3
-        BEAR / NEUTRAL / BULL
-
-المخرجات المهمة:
-
-    - current_regime
-    - posterior probabilities
-    - confidence
-    - uncertainty
-    - transition matrix
-    - expected duration
-    - regime persistence
-    - state statistics
-    - AIC / BIC
-    - convergence status
-
-===========================================================
-IMPORTANT
-===========================================================
-
-HMM ليس نموذجاً مباشراً للتنبؤ بسعر BTC.
-
-استخدامه الصحيح داخل نظام التداول:
-
-    Market Data
-          |
-          v
-    Feature Engineering
-          |
-          v
-    HMM Regime Detection
-          |
-          +------> Regime Filter
-          |
-          +------> Risk Manager
-          |
-          +------> Position Sizing
-          |
-          v
-    Signal Engine
-
-ولا يجب أن يكون HMM وحده مسؤولاً عن Buy/Sell.
-
-===========================================================
-RESEARCH FOUNDATION
-===========================================================
-
-الفكرة الأساسية:
-
-    Hamilton (1989)
-    Markov Switching Models
-
-والأدبيات الخاصة بـ HMM:
-
-    Zucchini, MacDonald & Langrock
-    Hidden Markov Models for Time Series
-
-والتطبيقات المالية:
-
-    Bhar & Hamori
-    Hidden Markov Models:
-    Applications to Financial Economics
-
-وكذلك:
-
-    Rossi & Gallo (2006)
-    Volatility Estimation via Hidden Markov Models
-
-===========================================================
-RECOMMENDED
-===========================================================
-
-الفاصل:
-    4H
-
-عدد الشموع:
-    400 - 1000
-
-الحالات:
-    3
-
-مثال:
-
-    detect_regimes(
-        df,
-        n_states=3
-    )
-
-===========================================================
+Research references used in the design:
+- Hamilton (1989), Markov Switching Models.
+- Zucchini, MacDonald & Langrock, Hidden Markov Models for Time Series.
 """
 
 from __future__ import annotations
@@ -125,56 +34,49 @@ from typing import Any, Dict, Optional, Union
 import numpy as np
 import pandas as pd
 import requests
-
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
 
 
 # =====================================================================
-# LOGGER
+# LOGGER / CONSTANTS
 # =====================================================================
 
 log = logging.getLogger("hmm_regime")
-
 warnings.filterwarnings("ignore")
-
-
-# =====================================================================
-# CONSTANTS
-# =====================================================================
 
 BINANCE_URL = "https://data-api.binance.vision/api/v3/klines"
 
 DEFAULT_INTERVAL = "4h"
 DEFAULT_LIMIT = 500
-
-MIN_OBSERVATIONS = 150
-
 DEFAULT_N_STATES = 3
-DEFAULT_N_ITER = 2000
+DEFAULT_N_ITER = 800
 DEFAULT_ATTEMPTS = 5
 
+MIN_OBSERVATIONS = 150
 EPS = 1e-12
+
+# Confidence / uncertainty policy.
+DEFAULT_MIN_CONFIDENCE = 0.55
+DEFAULT_MAX_ENTROPY = 0.85
+
+# Quantile clipping reduces the influence of extreme observations without
+# deleting rows from the sequence.
+CLIP_LOW = 0.01
+CLIP_HIGH = 0.99
 
 
 # =====================================================================
-# HELPERS
+# NUMERIC HELPERS
 # =====================================================================
 
 def _validate_series(series: pd.Series, name: str = "series") -> pd.Series:
-    """
-    تنظيف والتحقق من سلسلة رقمية.
-    """
-
+    """Return a clean finite float Series."""
     if not isinstance(series, pd.Series):
         series = pd.Series(series)
 
     result = pd.to_numeric(series, errors="coerce")
-
-    result = result.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    ).dropna()
+    result = result.replace([np.inf, -np.inf], np.nan).dropna()
 
     if result.empty:
         raise ValueError(f"{name} فارغة بعد التنظيف")
@@ -183,89 +85,53 @@ def _validate_series(series: pd.Series, name: str = "series") -> pd.Series:
 
 
 def _safe_zscore(series: pd.Series) -> pd.Series:
-    """
-    Z-score آمن.
-    """
-
+    """Cross-sectional/time-series safe z-score."""
     std = float(series.std())
-
     if not np.isfinite(std) or std < EPS:
-        return pd.Series(
-            np.zeros(len(series)),
-            index=series.index,
-            dtype=float,
-        )
-
-    mean = float(series.mean())
-
-    return (series - mean) / std
+        return pd.Series(0.0, index=series.index, dtype=float)
+    return (series - float(series.mean())) / std
 
 
 def _entropy(probabilities: np.ndarray) -> float:
-    """
-    Entropy normalized to [0,1].
-
-    0:
-        certainty عالية
-
-    1:
-        uncertainty عالية
-    """
-
+    """Normalized Shannon entropy in [0, 1]."""
     p = np.asarray(probabilities, dtype=float)
-
-    p = np.clip(p, EPS, 1.0)
-
-    p = p / p.sum()
+    p = np.clip(p, EPS, None)
+    total = float(p.sum())
+    if total <= EPS:
+        return 1.0
+    p = p / total
 
     if len(p) <= 1:
         return 0.0
 
-    entropy = -np.sum(p * np.log(p))
-
-    max_entropy = np.log(len(p))
-
-    if max_entropy <= 0:
-        return 0.0
-
-    return float(entropy / max_entropy)
+    value = float(-np.sum(p * np.log(p)))
+    maximum = float(np.log(len(p)))
+    return float(np.clip(value / maximum, 0.0, 1.0)) if maximum > 0 else 0.0
 
 
 def _expected_duration(probability_stay: float) -> float:
-    """
-    Expected duration of a Markov state.
-
-    E[D] = 1 / (1 - p_ii)
-
-    إذا كان p_ii قريباً جداً من 1
-    نعيد inf.
-    """
-
+    """Expected number of observations before leaving a state."""
     p = float(np.clip(probability_stay, 0.0, 1.0))
-
     if p >= 1.0 - EPS:
         return float("inf")
-
-    if p <= 0:
-        return 1.0
-
     return float(1.0 / (1.0 - p))
 
 
 def _consecutive_count(states: np.ndarray, target_state: int) -> int:
-    """
-    عدد الشموع المتتالية التي بقيت فيها الحالة الحالية.
-    """
-
+    """Number of consecutive observations in target_state at the end."""
     count = 0
-
     for state in reversed(states):
-        if int(state) == int(target_state):
-            count += 1
-        else:
+        if int(state) != int(target_state):
             break
-
+        count += 1
     return count
+
+
+def _validate_window(value: int, name: str) -> int:
+    value = int(value)
+    if value < 2:
+        raise ValueError(f"{name} يجب أن يكون >= 2")
+    return value
 
 
 # =====================================================================
@@ -279,221 +145,96 @@ def fetch_ohlcv(
     timeout: int = 20,
     drop_incomplete: bool = True,
 ) -> pd.DataFrame:
-    """
-    جلب بيانات OHLCV من Binance.
-
-    Parameters
-    ----------
-    symbol:
-        مثال BTCUSDT
-
-    interval:
-        1h / 4h / 1d ...
-
-    limit:
-        عدد الشموع.
-
-    drop_incomplete:
-        حذف آخر شمعة إذا كانت لا تزال مفتوحة.
-
-    Returns
-    -------
-    pd.DataFrame
-    """
-
+    """Fetch and validate Binance OHLCV candles."""
     symbol = str(symbol).upper().strip()
-
     if not symbol:
         raise ValueError("symbol فارغ")
 
+    limit = int(limit)
     if limit < MIN_OBSERVATIONS:
-        raise ValueError(
-            f"limit يجب أن يكون >= {MIN_OBSERVATIONS}"
-        )
+        raise ValueError(f"limit يجب أن يكون >= {MIN_OBSERVATIONS}")
 
     response = requests.get(
         BINANCE_URL,
-        params={
-            "symbol": symbol,
-            "interval": interval,
-            "limit": int(limit),
-        },
-        timeout=timeout,
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=int(timeout),
     )
-
     response.raise_for_status()
 
     raw = response.json()
-
     if not isinstance(raw, list):
         raise ValueError("استجابة Binance غير صالحة")
-
     if len(raw) < MIN_OBSERVATIONS:
-        raise ValueError(
-            f"بيانات غير كافية: {len(raw)} شمعة"
-        )
+        raise ValueError(f"بيانات غير كافية: {len(raw)} شمعة")
 
     columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore",
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
     ]
+    df = pd.DataFrame(raw, columns=columns)
 
-    df = pd.DataFrame(
-        raw,
-        columns=columns,
-    )
+    numeric = ["open", "high", "low", "close", "volume", "quote_volume"]
+    for column in numeric:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume",
-    ]
-
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
-
-    df["timestamp"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms",
-        utc=True,
-    )
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time_dt"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
 
     df = df[
         [
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
+            "timestamp", "open", "high", "low", "close", "volume",
+            "quote_volume", "close_time_dt",
         ]
     ].copy()
 
-    df = df.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    ).dropna()
-
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
     if df.empty:
         raise ValueError("OHLCV فارغة بعد التنظيف")
 
-    # --------------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------------
-
-    if (df["open"] <= 0).any():
-        raise ValueError("وجد open <= 0")
-
-    if (df["high"] <= 0).any():
-        raise ValueError("وجد high <= 0")
-
-    if (df["low"] <= 0).any():
-        raise ValueError("وجد low <= 0")
-
-    if (df["close"] <= 0).any():
-        raise ValueError("وجد close <= 0")
-
+    # Basic OHLCV sanity checks.
+    if (df[["open", "high", "low", "close"]] <= 0).any().any():
+        raise ValueError("OHLC prices يجب أن تكون > 0")
     if (df["volume"] < 0).any():
-        raise ValueError("وجد volume سالب")
-
+        raise ValueError("volume لا يمكن أن يكون سالباً")
     if (df["high"] < df["low"]).any():
-        raise ValueError(
-            "بيانات OHLC غير منطقية: high < low"
-        )
+        raise ValueError("وجد high < low")
+    if (df["high"] < df[["open", "close"]].max(axis=1)).any():
+        raise ValueError("high أقل من open/close")
+    if (df["low"] > df[["open", "close"]].min(axis=1)).any():
+        raise ValueError("low أعلى من open/close")
 
-    if (df["high"] < df["open"]).any():
-        raise ValueError(
-            "بيانات OHLC غير منطقية: high < open"
-        )
-
-    if (df["high"] < df["close"]).any():
-        raise ValueError(
-            "بيانات OHLC غير منطقية: high < close"
-        )
-
-    if (df["low"] > df["open"]).any():
-        raise ValueError(
-            "بيانات OHLC غير منطقية: low > open"
-        )
-
-    if (df["low"] > df["close"]).any():
-        raise ValueError(
-            "بيانات OHLC غير منطقية: low > close"
-        )
-
-    df = df.sort_values("timestamp")
-
-    df = df.drop_duplicates(
-        subset="timestamp",
-        keep="last",
+    df = (
+        df.sort_values("timestamp")
+        .drop_duplicates(subset="timestamp", keep="last")
+        .reset_index(drop=True)
     )
 
-    df = df.reset_index(drop=True)
-
-    # --------------------------------------------------------------
-    # Remove incomplete candle
-    # --------------------------------------------------------------
-
+    # Binance normally returns the current open candle as the last row.
+    # Remove it only when it is actually still open.
     if drop_incomplete and len(df) >= 2:
-        df = df.iloc[:-1].copy()
+        now = pd.Timestamp.now(tz="UTC")
+        if df.iloc[-1]["close_time_dt"] > now:
+            df = df.iloc[:-1].copy()
+
+    df = df.drop(columns=["close_time_dt"])
 
     if len(df) < MIN_OBSERVATIONS:
-        raise ValueError(
-            "عدد البيانات أصبح غير كافٍ بعد تنظيف الشموع"
-        )
+        raise ValueError("عدد البيانات أصبح غير كافٍ بعد تنظيف الشموع")
 
     return df
 
-
-# =====================================================================
-# BACKWARD COMPATIBILITY
-# =====================================================================
 
 def fetch_returns(
     symbol: str,
     interval: str = DEFAULT_INTERVAL,
     limit: int = DEFAULT_LIMIT,
 ) -> pd.Series:
-    """
-    وظيفة متوافقة مع النسخة القديمة.
-
-    تعيد Log Returns فقط.
-    """
-
-    df = fetch_ohlcv(
-        symbol=symbol,
-        interval=interval,
-        limit=limit,
-    )
-
-    returns = np.log(
-        df["close"] / df["close"].shift(1)
-    )
-
-    returns = returns.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    ).dropna()
-
+    """Backward-compatible helper returning log returns."""
+    df = fetch_ohlcv(symbol, interval=interval, limit=limit)
+    returns = np.log(df["close"] / df["close"].shift(1))
+    returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
     returns.name = "log_return"
-
     return returns
 
 
@@ -508,278 +249,211 @@ def build_features(
     volume_window: int = 24,
 ) -> pd.DataFrame:
     """
-    بناء خصائص HMM.
+    Build the HMM observation matrix.
 
-    إذا كان الإدخال DataFrame يحتوي OHLCV:
-        يتم استخدام جميع الخصائص.
+    DataFrame input (preferred)
+        Uses real OHLCV-derived range and volume information.
 
-    إذا كان الإدخال Series:
-        يتم استخدام خصائص العائد فقط.
+    Series input (legacy / current quant_alert path)
+        There is no high/low/volume information. To keep the historical
+        API working, the function creates stable fallback features:
 
-    Features:
+        range    = abs(log return)     [proxy only]
+        volume_z = 0                   [neutral because volume is unknown]
 
-        return
-        realized_vol
-        range
-        volume_z
-        momentum
-        return_z
+    This prevents the old KeyError while making the limitation explicit.
     """
+    volatility_window = _validate_window(volatility_window, "volatility_window")
+    momentum_window = _validate_window(momentum_window, "momentum_window")
+    volume_window = _validate_window(volume_window, "volume_window")
 
     if isinstance(data, pd.Series):
-
-        returns = _validate_series(
-            data,
-            name="returns",
-        )
-
-        features = pd.DataFrame(
-            index=returns.index
-        )
+        returns = _validate_series(data, "returns")
+        features = pd.DataFrame(index=returns.index)
 
         features["return"] = returns
+        features["realized_vol"] = returns.rolling(volatility_window).std()
 
-        features["realized_vol"] = (
-            returns
-            .rolling(volatility_window)
-            .std()
-        )
+        # Returns-only proxy. It is NOT equivalent to true OHLC range.
+        features["range"] = returns.abs()
 
-        features["momentum"] = (
-            returns
-            .rolling(momentum_window)
-            .sum()
-        )
+        # Volume is unavailable in a Series-only input.
+        features["volume_z"] = 0.0
 
-        historical_vol = (
-            returns
-            .rolling(volatility_window)
-            .std()
-            .shift(1)
-        )
-
-        features["return_z"] = (
-            returns / historical_vol.clip(lower=EPS)
-        )
-
-    elif isinstance(data, pd.DataFrame):
-
-        required = {
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        }
-
-        missing = required - set(data.columns)
-
-        if missing:
-            raise ValueError(
-                f"OHLCV columns ناقصة: {sorted(missing)}"
-            )
-
-        df = data.copy()
-
-        close = pd.to_numeric(
-            df["close"],
-            errors="coerce",
-        )
-
-        high = pd.to_numeric(
-            df["high"],
-            errors="coerce",
-        )
-
-        low = pd.to_numeric(
-            df["low"],
-            errors="coerce",
-        )
-
-        volume = pd.to_numeric(
-            df["volume"],
-            errors="coerce",
-        )
-
-        returns = np.log(
-            close / close.shift(1)
-        )
-
-        features = pd.DataFrame(
-            index=df.index
-        )
-
-        # ----------------------------------------------------------
-        # 1. Return
-        # ----------------------------------------------------------
-
-        features["return"] = returns
-
-        # ----------------------------------------------------------
-        # 2. Realized volatility
-        # ----------------------------------------------------------
-
-        features["realized_vol"] = (
-            returns
-            .rolling(volatility_window)
-            .std()
-        )
-
-        # ----------------------------------------------------------
-        # 3. High-Low range
-        # ----------------------------------------------------------
-
-        features["range"] = np.log(
-            high / low
-        )
-
-        # ----------------------------------------------------------
-        # 4. Volume Z-score
-        # ----------------------------------------------------------
-
-        volume_mean = (
-            volume
-            .rolling(volume_window)
-            .mean()
-        )
-
-        volume_std = (
-            volume
-            .rolling(volume_window)
-            .std()
-        )
-
-        features["volume_z"] = (
-            (volume - volume_mean)
-            / volume_std.clip(lower=EPS)
-        )
-
-        # ----------------------------------------------------------
-        # 5. Momentum
-        # ----------------------------------------------------------
-
-        features["momentum"] = np.log(
-            close
-            / close.shift(momentum_window)
-        )
-
-        # ----------------------------------------------------------
-        # 6. Return Z-score
-        # ----------------------------------------------------------
+        features["momentum"] = returns.rolling(momentum_window).sum()
 
         previous_vol = (
-            returns
-            .rolling(volatility_window)
-            .std()
-            .shift(1)
+            returns.rolling(volatility_window).std().shift(1)
+        )
+        features["return_z"] = returns / previous_vol.clip(lower=EPS)
+
+        feature_source = "returns_only"
+
+    elif isinstance(data, pd.DataFrame):
+        required = {"open", "high", "low", "close", "volume"}
+        missing = required - set(data.columns)
+        if missing:
+            raise ValueError(f"OHLCV columns ناقصة: {sorted(missing)}")
+
+        df = data.copy()
+        close = pd.to_numeric(df["close"], errors="coerce")
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        volume = pd.to_numeric(df["volume"], errors="coerce")
+
+        returns = np.log(close / close.shift(1))
+        features = pd.DataFrame(index=df.index)
+
+        features["return"] = returns
+        features["realized_vol"] = returns.rolling(volatility_window).std()
+        features["range"] = np.log(high / low).clip(lower=0.0)
+
+        volume_mean = volume.rolling(volume_window).mean()
+        volume_std = volume.rolling(volume_window).std()
+        # Cross-window z-score is more informative than a raw volume level.
+        features["volume_z"] = (
+            (volume - volume_mean) / volume_std.clip(lower=EPS)
         )
 
-        features["return_z"] = (
-            returns
-            / previous_vol.clip(lower=EPS)
+        features["momentum"] = np.log(
+            close / close.shift(momentum_window)
         )
+
+        previous_vol = (
+            returns.rolling(volatility_window).std().shift(1)
+        )
+        features["return_z"] = returns / previous_vol.clip(lower=EPS)
+
+        feature_source = "ohlcv"
 
     else:
+        raise TypeError("data يجب أن يكون pandas Series أو DataFrame")
 
-        raise TypeError(
-            "data يجب أن يكون pandas Series أو DataFrame"
-        )
-
-    # --------------------------------------------------------------
-    # Numerical cleanup
-    # --------------------------------------------------------------
-
-    features = features.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-
-    features = features.dropna()
-
+    features = features.replace([np.inf, -np.inf], np.nan).dropna()
     if features.empty:
-        raise ValueError(
-            "لا توجد features صالحة بعد الحساب"
-        )
+        raise ValueError("لا توجد features صالحة بعد الحساب")
 
-    # --------------------------------------------------------------
-    # Conservative clipping for extreme observations
-    #
-    # This prevents one flash-move from dominating GaussianHMM.
-    # --------------------------------------------------------------
-
+    # Protect the Gaussian likelihood from isolated extreme observations.
+    # The rows themselves remain in the sequence.
     for column in features.columns:
+        lower = float(features[column].quantile(CLIP_LOW))
+        upper = float(features[column].quantile(CLIP_HIGH))
+        if np.isfinite(lower) and np.isfinite(upper) and upper >= lower:
+            features[column] = features[column].clip(lower=lower, upper=upper)
 
-        lower = features[column].quantile(0.01)
-        upper = features[column].quantile(0.99)
-
-        if np.isfinite(lower) and np.isfinite(upper):
-            features[column] = features[column].clip(
-                lower=lower,
-                upper=upper,
-            )
-
+    features.attrs["feature_source"] = feature_source
+    features.attrs["range_is_proxy"] = feature_source == "returns_only"
+    features.attrs["volume_available"] = feature_source == "ohlcv"
     return features
 
 
 # =====================================================================
-# LABEL STATES
+# STATE LABELING
 # =====================================================================
 
-def label_states(
-    state_statistics: pd.DataFrame,
-    n_states: int,
-) -> Dict[int, str]:
-    """
-    تحويل أرقام الحالات العشوائية إلى أسماء اقتصادية.
+def label_states(state_statistics: pd.DataFrame, n_states: int) -> Dict[int, str]:
+    """Map arbitrary HMM state IDs to economically readable labels."""
+    if state_statistics.empty:
+        raise ValueError("state_statistics فارغ")
 
-    HMM لا يعرف مسبقاً أن state 0 = Bear.
-
-    لذلك نقوم بترتيب الحالات حسب متوسط العائد.
-
-    2 states:
-        الأقل = Bear
-        الأعلى = Bull
-
-    3 states:
-        الأقل = Bear
-        الوسط = Neutral
-        الأعلى = Bull
-    """
-
-    ordered_states = list(
-        state_statistics
-        .sort_values("mean_return")
-        .index
-    )
-
+    ordered = list(state_statistics.sort_values("mean_return").index)
     labels: Dict[int, str] = {}
 
     if n_states == 2:
-
-        labels[ordered_states[0]] = "BEAR"
-        labels[ordered_states[1]] = "BULL"
-
+        labels[ordered[0]] = "BEAR"
+        labels[ordered[-1]] = "BULL"
     elif n_states == 3:
-
-        labels[ordered_states[0]] = "BEAR"
-        labels[ordered_states[1]] = "NEUTRAL"
-        labels[ordered_states[2]] = "BULL"
-
+        labels[ordered[0]] = "BEAR"
+        labels[ordered[1]] = "NEUTRAL"
+        labels[ordered[2]] = "BULL"
     else:
-
-        # Generalized labeling
-        labels[ordered_states[0]] = "BEAR"
-        labels[ordered_states[-1]] = "BULL"
-
-        for state in ordered_states[1:-1]:
+        labels[ordered[0]] = "BEAR"
+        labels[ordered[-1]] = "BULL"
+        for state in ordered[1:-1]:
             labels[state] = f"NEUTRAL_{state}"
 
     return labels
 
 
+def _canonicalize_probability_vector(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    values = np.clip(values, 0.0, None)
+    total = float(values.sum())
+    if total <= EPS:
+        return np.full(len(values), 1.0 / max(len(values), 1))
+    return values / total
+
+
 # =====================================================================
-# HMM FITTING
+# HMM ENGINE
 # =====================================================================
+
+def _fit_best_model(
+    X: np.ndarray,
+    n_states: int,
+    n_iter: int,
+    attempts: int,
+    random_state: int,
+) -> tuple[GaussianHMM, float, bool, int]:
+    """Fit several initializations and choose the strongest valid model."""
+    best_model: Optional[GaussianHMM] = None
+    best_score = -np.inf
+    best_converged = False
+    successful = 0
+
+    # Prefer converged models. Only if none converge do we fall back to the
+    # best finite-likelihood model, preserving availability in difficult data.
+    best_converged_model: Optional[GaussianHMM] = None
+    best_converged_score = -np.inf
+
+    for attempt in range(attempts):
+        seed = int(random_state + attempt)
+        try:
+            model = GaussianHMM(
+                n_components=n_states,
+                covariance_type="diag",
+                n_iter=n_iter,
+                tol=1e-4,
+                random_state=seed,
+                min_covar=1e-4,
+                verbose=False,
+            )
+            model.fit(X)
+            score = float(model.score(X))
+            if not np.isfinite(score):
+                raise ValueError("non-finite log-likelihood")
+
+            converged = bool(getattr(model.monitor_, "converged", False))
+            successful += 1
+
+            log.info(
+                "HMM attempt=%d/%d score=%.4f converged=%s",
+                attempt + 1,
+                attempts,
+                score,
+                converged,
+            )
+
+            if score > best_score:
+                best_model = model
+                best_score = score
+                best_converged = converged
+
+            if converged and score > best_converged_score:
+                best_converged_model = model
+                best_converged_score = score
+
+        except Exception as exc:
+            log.warning("HMM attempt %d failed: %s", attempt + 1, exc)
+
+    if best_converged_model is not None:
+        return best_converged_model, best_converged_score, True, successful
+
+    if best_model is not None:
+        return best_model, best_score, best_converged, successful
+
+    raise RuntimeError("HMM فشل في جميع محاولات التدريب")
+
 
 def detect_regimes(
     data: Union[pd.DataFrame, pd.Series],
@@ -790,55 +464,30 @@ def detect_regimes(
     volatility_window: int = 24,
     momentum_window: int = 12,
     volume_window: int = 24,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    max_entropy: float = DEFAULT_MAX_ENTROPY,
 ) -> Dict[str, Any]:
     """
-    تدريب Gaussian HMM واكتشاف الأنظمة.
+    Fit the Gaussian HMM and return a complete regime analysis object.
 
-    Parameters
-    ----------
-    data:
-        DataFrame OHLCV أو Series returns.
-
-    n_states:
-        عدد الحالات.
-
-    n_iter:
-        الحد الأقصى لتكرارات EM.
-
-        ملاحظة:
-        n_iter الكبير لا "يضمن" convergence.
-
-    attempts:
-        عدد محاولات initialization.
-
-    Returns
-    -------
-    dict
+    The result preserves the keys expected by the existing MEGA modules,
+    while adding explicit diagnostics such as feature source and trust state.
     """
+    n_states = int(n_states)
+    n_iter = int(n_iter)
+    attempts = int(attempts)
 
     if n_states < 2:
-        raise ValueError(
-            "n_states يجب أن يكون >= 2"
-        )
-
+        raise ValueError("n_states يجب أن يكون >= 2")
     if n_states > 5:
-        raise ValueError(
-            "n_states > 5 غير مستحسن لهذا النظام"
-        )
-
+        raise ValueError("n_states > 5 غير مستحسن لهذا النظام")
     if n_iter < 100:
-        raise ValueError(
-            "n_iter يجب أن يكون >= 100"
-        )
-
+        raise ValueError("n_iter يجب أن يكون >= 100")
     if attempts < 1:
-        raise ValueError(
-            "attempts يجب أن يكون >= 1"
-        )
+        raise ValueError("attempts يجب أن يكون >= 1")
 
-    # --------------------------------------------------------------
-    # Features
-    # --------------------------------------------------------------
+    min_confidence = float(np.clip(min_confidence, 0.0, 1.0))
+    max_entropy = float(np.clip(max_entropy, 0.0, 1.0))
 
     features = build_features(
         data=data,
@@ -847,464 +496,210 @@ def detect_regimes(
         volume_window=volume_window,
     )
 
+    # HMM fitting requires enough effective observations for both transition
+    # estimation and the rolling features.
     if len(features) < MIN_OBSERVATIONS:
         raise ValueError(
-            f"عدد observations غير كافٍ: {len(features)}"
+            f"عدد observations غير كافٍ: {len(features)} < {MIN_OBSERVATIONS}"
         )
 
     feature_names = list(features.columns)
-
-    raw_X = features.values.astype(float)
-
+    raw_X = features.to_numpy(dtype=float)
     if not np.isfinite(raw_X).all():
-        raise ValueError(
-            "X يحتوي NaN أو Inf"
-        )
-
-    # --------------------------------------------------------------
-    # Standardization
-    # --------------------------------------------------------------
+        raise ValueError("X يحتوي NaN أو Inf")
 
     scaler = StandardScaler()
-
     X = scaler.fit_transform(raw_X)
-
     if not np.isfinite(X).all():
-        raise ValueError(
-            "فشل StandardScaler: X غير صالح"
-        )
+        raise ValueError("فشل StandardScaler: X غير صالح")
+
+    model, log_likelihood, converged, successful_models = _fit_best_model(
+        X=X,
+        n_states=n_states,
+        n_iter=n_iter,
+        attempts=attempts,
+        random_state=random_state,
+    )
+
+    hidden_states = model.predict(X)
+    posterior = np.asarray(model.predict_proba(X), dtype=float)
+    if posterior.ndim != 2 or posterior.shape[1] != n_states:
+        raise RuntimeError("predict_proba أعاد shape غير متوقع")
+
+    posterior = np.vstack(
+        [_canonicalize_probability_vector(row) for row in posterior]
+    )
 
     # --------------------------------------------------------------
-    # Multiple random initializations
+    # State statistics in original feature units
     # --------------------------------------------------------------
-
-    best_model: Optional[GaussianHMM] = None
-    best_score = -np.inf
-    best_converged = False
-
-    successful_models = 0
-
-    for attempt in range(attempts):
-
-        seed = int(random_state + attempt)
-
-        try:
-
-            model = GaussianHMM(
-                n_components=n_states,
-                covariance_type="diag",
-                n_iter=n_iter,
-                tol=1e-4,
-                random_state=seed,
-                min_covar=1e-4,
-                verbose=False,
-            )
-
-            model.fit(X)
-
-            score = float(
-                model.score(X)
-            )
-
-            converged = bool(
-                getattr(
-                    model.monitor_,
-                    "converged",
-                    False,
-                )
-            )
-
-            successful_models += 1
-
-            log.info(
-                "HMM attempt=%d score=%.4f converged=%s",
-                attempt + 1,
-                score,
-                converged,
-            )
-
-            # Prefer higher likelihood.
-            if score > best_score:
-
-                best_score = score
-                best_model = model
-                best_converged = converged
-
-        except Exception as exc:
-
-            log.warning(
-                "HMM attempt %d failed: %s",
-                attempt + 1,
-                exc,
-            )
-
-    if best_model is None:
-
-        raise RuntimeError(
-            "HMM فشل في جميع محاولات التدريب"
-        )
-
-    # --------------------------------------------------------------
-    # Decode states
-    # --------------------------------------------------------------
-
-    hidden_states = best_model.predict(X)
-
-    # True posterior probabilities
-    posterior = best_model.predict_proba(X)
-
-    if posterior.ndim != 2:
-        raise RuntimeError(
-            "predict_proba أعاد shape غير متوقع"
-        )
-
-    # --------------------------------------------------------------
-    # State statistics in ORIGINAL feature space
-    # --------------------------------------------------------------
-
-    stats_rows = []
-
+    rows = []
     for state in range(n_states):
-
         mask = hidden_states == state
-
         count = int(mask.sum())
 
-        if count > 0:
-
-            state_features = features.loc[mask]
-
-            mean_return = float(
-                state_features["return"].mean()
-            )
-
-            mean_vol = float(
-                state_features["realized_vol"].mean()
-            )
-
-            mean_range = float(
-                state_features["range"].mean()
-            )
-
-            mean_volume_z = float(
-                state_features["volume_z"].mean()
-            )
-
-            mean_momentum = float(
-                state_features["momentum"].mean()
-            )
-
-        else:
-
-            mean_return = 0.0
-            mean_vol = 0.0
-            mean_range = 0.0
-            mean_volume_z = 0.0
-            mean_momentum = 0.0
-
-        stats_rows.append(
-            {
+        if count:
+            state_features = features.iloc[np.flatnonzero(mask)]
+            row = {
                 "state": state,
                 "count": count,
                 "pct": count / len(hidden_states) * 100.0,
-                "mean_return": mean_return,
-                "mean_volatility": mean_vol,
-                "mean_range": mean_range,
-                "mean_volume_z": mean_volume_z,
-                "mean_momentum": mean_momentum,
+                "mean_return": float(state_features["return"].mean()),
+                "mean_volatility": float(state_features["realized_vol"].mean()),
+                "mean_range": float(state_features["range"].mean()),
+                "mean_volume_z": float(state_features["volume_z"].mean()),
+                "mean_momentum": float(state_features["momentum"].mean()),
             }
-        )
+        else:
+            row = {
+                "state": state,
+                "count": 0,
+                "pct": 0.0,
+                "mean_return": 0.0,
+                "mean_volatility": 0.0,
+                "mean_range": 0.0,
+                "mean_volume_z": 0.0,
+                "mean_momentum": 0.0,
+            }
+        rows.append(row)
 
-    state_statistics = (
-        pd.DataFrame(stats_rows)
-        .set_index("state")
-    )
-
-    labels = label_states(
-        state_statistics,
-        n_states=n_states,
-    )
-
-    state_statistics["label"] = [
-        labels[state]
-        for state in state_statistics.index
-    ]
+    state_statistics = pd.DataFrame(rows).set_index("state")
+    labels = label_states(state_statistics, n_states=n_states)
+    state_statistics["label"] = [labels[int(i)] for i in state_statistics.index]
 
     # --------------------------------------------------------------
-    # Current state
+    # Current state / posterior
     # --------------------------------------------------------------
+    current_state = int(hidden_states[-1])
+    current_probabilities = _canonicalize_probability_vector(posterior[-1])
+    current_probability = float(current_probabilities[current_state])
+    max_probability = float(np.max(current_probabilities))
+    entropy = _entropy(current_probabilities)
 
-    current_state = int(
-        hidden_states[-1]
+    raw_regime = labels[current_state]
+    trusted = bool(
+        converged
+        and max_probability >= min_confidence
+        and entropy <= max_entropy
     )
+    reported_regime = raw_regime if trusted else "UNKNOWN"
 
-    current_probabilities = posterior[-1]
-
-    current_probability = float(
-        current_probabilities[current_state]
-    )
-
-    probability_map = {
+    regime_probabilities = {
         labels[i]: float(current_probabilities[i])
         for i in range(n_states)
     }
 
     # --------------------------------------------------------------
-    # Uncertainty
+    # State persistence / transitions
     # --------------------------------------------------------------
+    persistence = _consecutive_count(hidden_states, current_state)
 
-    normalized_entropy = _entropy(
-        current_probabilities
+    transition_matrix = np.asarray(model.transmat_, dtype=float)
+    if transition_matrix.shape != (n_states, n_states):
+        raise RuntimeError("transition matrix shape غير صحيح")
+    transition_matrix = np.clip(transition_matrix, 0.0, None)
+    transition_matrix = transition_matrix / transition_matrix.sum(
+        axis=1, keepdims=True
     )
 
-    max_probability = float(
-        np.max(current_probabilities)
+    stay_probability = float(transition_matrix[current_state, current_state])
+    expected_duration = _expected_duration(stay_probability)
+
+    next_state_probability = _canonicalize_probability_vector(
+        current_probabilities @ transition_matrix
     )
-
-    confidence = max_probability
-
-    # A conservative trust rule.
-    trusted = bool(
-        confidence >= 0.55
-        and normalized_entropy <= 0.85
-    )
-
-    current_regime = labels[current_state]
-
-    reported_regime = (
-        current_regime
-        if trusted
-        else "UNKNOWN"
-    )
-
-    # --------------------------------------------------------------
-    # State persistence
-    # --------------------------------------------------------------
-
-    persistence = _consecutive_count(
-        hidden_states,
-        current_state,
-    )
-
-    # --------------------------------------------------------------
-    # Transition matrix
-    # --------------------------------------------------------------
-
-    transition_matrix = np.asarray(
-        best_model.transmat_,
-        dtype=float,
-    )
-
-    if transition_matrix.shape != (
-        n_states,
-        n_states,
-    ):
-        raise RuntimeError(
-            "transition matrix shape غير صحيح"
-        )
-
-    # Ensure rows approximately sum to 1.
-    transition_matrix = (
-        transition_matrix
-        / transition_matrix.sum(
-            axis=1,
-            keepdims=True,
-        )
-    )
-
-    # Probability of remaining in current state.
-    stay_probability = float(
-        transition_matrix[
-            current_state,
-            current_state,
-        ]
-    )
-
-    expected_duration = _expected_duration(
-        stay_probability
-    )
-
-    # --------------------------------------------------------------
-    # Next-state probabilities
-    # --------------------------------------------------------------
-
-    next_state_probability = (
-        current_probabilities
-        @ transition_matrix
-    )
-
-    next_state_probability = (
-        next_state_probability
-        / next_state_probability.sum()
-    )
-
-    next_regime_map = {
-        labels[i]: float(
-            next_state_probability[i]
-        )
+    next_regime_probabilities = {
+        labels[i]: float(next_state_probability[i])
         for i in range(n_states)
     }
 
-    # --------------------------------------------------------------
-    # Regime change
-    # --------------------------------------------------------------
-
-    regime_changed = False
-
-    if len(hidden_states) >= 2:
-        regime_changed = bool(
-            hidden_states[-1]
-            != hidden_states[-2]
-        )
+    regime_changed = bool(
+        len(hidden_states) >= 2
+        and int(hidden_states[-1]) != int(hidden_states[-2])
+    )
 
     # --------------------------------------------------------------
-    # Model quality metrics
+    # Model information criteria
     # --------------------------------------------------------------
-
     n_samples, n_features = X.shape
-
-    # Gaussian diagonal HMM parameter count:
-    #
-    # transition probabilities:
-    #     n_states * (n_states - 1)
-    #
-    # initial probabilities:
-    #     n_states - 1
-    #
-    # means:
-    #     n_states * n_features
-    #
-    # variances:
-    #     n_states * n_features
-    #
     n_parameters = (
         n_states * (n_states - 1)
         + (n_states - 1)
-        + n_states * n_features
-        + n_states * n_features
+        + 2 * n_states * n_features
     )
 
-    aic = (
-        2.0 * n_parameters
-        - 2.0 * best_score
-    )
+    aic = float(2.0 * n_parameters - 2.0 * log_likelihood)
+    bic = float(n_parameters * np.log(n_samples) - 2.0 * log_likelihood)
 
-    bic = (
-        n_parameters
-        * np.log(n_samples)
-        - 2.0 * best_score
-    )
-
-    # --------------------------------------------------------------
-    # Model means/covariances
-    # These are standardized-space parameters.
-    # --------------------------------------------------------------
-
-    means_scaled = np.asarray(
-        best_model.means_,
-        dtype=float,
-    )
-
-    variances_scaled = np.asarray(
-        best_model.covars_,
-        dtype=float,
-    )
-
-    # --------------------------------------------------------------
-    # Logging
-    # --------------------------------------------------------------
+    means_scaled = np.asarray(model.means_, dtype=float)
+    variances_scaled = np.asarray(model.covars_, dtype=float)
 
     log.info(
-        "HMM completed | states=%d | "
-        "score=%.4f | converged=%s",
+        "HMM completed | source=%s | states=%d | score=%.4f | converged=%s | "
+        "regime=%s | probability=%.2f%% | confidence=%.2f%%",
+        features.attrs.get("feature_source", "unknown"),
         n_states,
-        best_score,
-        best_converged,
-    )
-
-    log.info(
-        "Current regime=%s | state=%d | "
-        "prob=%.2f%% | confidence=%.2f%%",
+        log_likelihood,
+        converged,
         reported_regime,
-        current_state,
         current_probability * 100.0,
-        confidence * 100.0,
+        max_probability * 100.0,
     )
 
     return {
-        # ----------------------------------------------------------
         # Core model
-        # ----------------------------------------------------------
-
-        "model": best_model,
+        "model": model,
         "scaler": scaler,
         "features": features,
         "feature_names": feature_names,
+        "feature_source": features.attrs.get("feature_source", "unknown"),
+        "range_is_proxy": bool(features.attrs.get("range_is_proxy", False)),
+        "volume_available": bool(features.attrs.get("volume_available", False)),
 
-        # ----------------------------------------------------------
         # States
-        # ----------------------------------------------------------
-
         "hidden_states": hidden_states,
         "current_state": current_state,
-        "current_regime": current_regime,
+        "current_regime": raw_regime,
+        "raw_regime": raw_regime,
         "reported_regime": reported_regime,
 
-        # ----------------------------------------------------------
         # Probabilities
-        # ----------------------------------------------------------
-
         "posterior_probabilities": posterior,
         "current_probabilities": current_probabilities,
-        "regime_probabilities": probability_map,
-
+        "regime_probabilities": regime_probabilities,
         "current_probability": current_probability,
         "max_probability": max_probability,
 
-        # ----------------------------------------------------------
-        # Confidence / uncertainty
-        # ----------------------------------------------------------
-
-        "confidence": confidence,
-        "entropy": normalized_entropy,
+        # Trust / uncertainty
+        "confidence": max_probability,
+        "entropy": entropy,
         "trusted": trusted,
+        "min_confidence": min_confidence,
+        "max_entropy": max_entropy,
 
-        # ----------------------------------------------------------
         # Dynamics
-        # ----------------------------------------------------------
-
         "transition_matrix": transition_matrix,
         "next_state_probability": next_state_probability,
-        "next_regime_probabilities": next_regime_map,
-
+        "next_regime_probabilities": next_regime_probabilities,
         "stay_probability": stay_probability,
         "expected_duration": expected_duration,
-
         "state_persistence": persistence,
         "regime_changed": regime_changed,
 
-        # ----------------------------------------------------------
-        # State statistics
-        # ----------------------------------------------------------
-
+        # Statistics
         "labels": labels,
         "state_statistics": state_statistics,
 
-        # ----------------------------------------------------------
         # HMM parameters
-        # ----------------------------------------------------------
-
         "means_scaled": means_scaled,
         "variances_scaled": variances_scaled,
 
-        # ----------------------------------------------------------
         # Model quality
-        # ----------------------------------------------------------
-
-        "log_likelihood": best_score,
-        "aic": float(aic),
-        "bic": float(bic),
-        "converged": best_converged,
+        "log_likelihood": float(log_likelihood),
+        "score_per_observation": float(log_likelihood / max(n_samples, 1)),
+        "aic": aic,
+        "bic": bic,
+        "converged": converged,
         "successful_models": successful_models,
         "attempts": attempts,
         "n_states": n_states,
@@ -1316,7 +711,7 @@ def detect_regimes(
 
 
 # =====================================================================
-# CURRENT REGIME
+# CURRENT REGIME API
 # =====================================================================
 
 def get_current_regime(
@@ -1325,68 +720,41 @@ def get_current_regime(
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    إرجاع ملخص النظام الحالي.
+    Return the current regime in the compact shape expected by MEGA.
 
-    لا يعيد تدريب HMM أكثر من مرة داخل هذه العملية.
+    Safety improvement:
+    ``current_regime`` is the *reported* regime, so low-confidence or
+    non-converged models become ``UNKNOWN`` and are not silently treated as
+    confirmed market states by downstream filters.
     """
-
-    result = detect_regimes(
-        data=data,
-        n_states=n_states,
-        **kwargs,
-    )
+    result = detect_regimes(data=data, n_states=n_states, **kwargs)
 
     return {
         "current_state": result["current_state"],
-        "current_regime": result["current_regime"],
+        "current_regime": result["reported_regime"],
+        "raw_regime": result["raw_regime"],
         "reported_regime": result["reported_regime"],
-
         "regime_prob": result["current_probability"],
         "confidence": result["confidence"],
         "entropy": result["entropy"],
         "trusted": result["trusted"],
-
-        "regime_probabilities": result[
-            "regime_probabilities"
-        ],
-
-        "next_regime_probabilities": result[
-            "next_regime_probabilities"
-        ],
-
-        "stay_probability": result[
-            "stay_probability"
-        ],
-
-        "expected_duration": result[
-            "expected_duration"
-        ],
-
-        "state_persistence": result[
-            "state_persistence"
-        ],
-
-        "regime_changed": result[
-            "regime_changed"
-        ],
-
-        "means": result[
-            "state_statistics"
-        ]["mean_return"].to_numpy(),
-
-        "variances": result[
-            "variances_scaled"
-        ],
-
-        "transition_matrix": result[
-            "transition_matrix"
-        ],
-
+        "regime_probabilities": result["regime_probabilities"],
+        "next_regime_probabilities": result["next_regime_probabilities"],
+        "stay_probability": result["stay_probability"],
+        "expected_duration": result["expected_duration"],
+        "state_persistence": result["state_persistence"],
+        "regime_changed": result["regime_changed"],
+        "means": result["state_statistics"]["mean_return"].to_numpy(),
+        "variances": result["variances_scaled"],
+        "transition_matrix": result["transition_matrix"],
         "n_states": result["n_states"],
-
         "aic": result["aic"],
         "bic": result["bic"],
         "converged": result["converged"],
+        "feature_source": result["feature_source"],
+        "range_is_proxy": result["range_is_proxy"],
+        "volume_available": result["volume_available"],
+        "score_per_observation": result["score_per_observation"],
     }
 
 
@@ -1398,120 +766,51 @@ def filter_signals_by_regime(
     signal: int,
     current_regime: str,
     confidence: float = 1.0,
-    min_confidence: float = 0.55,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
     trusted: Optional[bool] = None,
 ) -> int:
     """
-    فلترة الإشارة بناءً على حالة السوق.
+    Filter a Spot signal by HMM regime.
 
-    signal:
-        +1 = BUY / زيادة التعرض
-         0 = HOLD
-        -1 = SELL / تخفيض التعرض
+    +1 = BUY / increase Spot exposure
+     0 = HOLD
+    -1 = SELL / reduce Spot exposure
 
-    السياسة:
-
-        UNKNOWN:
-            لا دخول جديد.
-
-        BEAR:
-            BUY يتم حجبه.
-            SELL يسمح به لتقليل التعرض.
-
-        NEUTRAL:
-            تمرير الإشارة.
-
-        BULL:
-            تمرير الإشارة.
-
-    ملاحظة مهمة:
-        SELL هنا يعني تخفيض التعرض في Spot.
-        لا يعني فتح Short.
+    SELL is never interpreted as opening a short position.
     """
-
     signal = int(np.sign(signal))
-
-    current_regime = str(
-        current_regime
-    ).upper()
-
-    confidence = float(
-        np.clip(confidence, 0.0, 1.0)
-    )
+    current_regime = str(current_regime).strip().upper()
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    min_confidence = float(np.clip(min_confidence, 0.0, 1.0))
 
     if trusted is None:
         trusted = confidence >= min_confidence
 
-    # --------------------------------------------------------------
-    # Untrusted model
-    # --------------------------------------------------------------
-
-    if not trusted:
+    if not trusted or confidence < min_confidence:
         log.info(
-            "[HMM FILTER] blocked: model not trusted"
+            "[HMM FILTER] blocked: trusted=%s confidence=%.2f%%",
+            trusted,
+            confidence * 100.0,
         )
         return 0
 
-    if confidence < min_confidence:
-        log.info(
-            "[HMM FILTER] blocked: "
-            "confidence %.2f%% < %.2f%%",
-            confidence * 100,
-            min_confidence * 100,
-        )
+    if current_regime in {"UNKNOWN", "UNDEFINED", "NONE", ""}:
         return 0
 
-    # --------------------------------------------------------------
-    # UNKNOWN
-    # --------------------------------------------------------------
-
-    if current_regime == "UNKNOWN":
-        if signal != 0:
-            log.info(
-                "[HMM FILTER] UNKNOWN -> signal blocked"
-            )
+    if current_regime == "BEAR" and signal == 1:
+        log.info("[HMM FILTER] BUY blocked (BEAR regime)")
         return 0
-
-    # --------------------------------------------------------------
-    # BEAR
-    # --------------------------------------------------------------
-
-    if current_regime == "BEAR":
-
-        if signal == 1:
-
-            log.info(
-                "[HMM FILTER] BUY blocked "
-                "(BEAR regime)"
-            )
-
-            return 0
-
-        return signal
-
-    # --------------------------------------------------------------
-    # NEUTRAL
-    # --------------------------------------------------------------
-
-    if current_regime.startswith("NEUTRAL"):
-        return signal
-
-    # --------------------------------------------------------------
-    # BULL
-    # --------------------------------------------------------------
 
     if current_regime == "BULL":
         return signal
 
-    # --------------------------------------------------------------
-    # Unknown label
-    # --------------------------------------------------------------
+    if current_regime.startswith("NEUTRAL"):
+        return signal
 
-    log.warning(
-        "[HMM FILTER] Unknown regime label: %s",
-        current_regime,
-    )
+    if current_regime == "BEAR":
+        return signal
 
+    log.warning("[HMM FILTER] Unknown regime label: %s", current_regime)
     return 0
 
 
@@ -1525,76 +824,25 @@ def regime_risk_multiplier(
     min_multiplier: float = 0.0,
     max_multiplier: float = 1.0,
 ) -> float:
-    """
-    معامل إضافي لإدارة المخاطر.
+    """Return an exposure multiplier; this is not a complete position size."""
+    current_regime = str(current_regime).strip().upper()
+    confidence = float(np.clip(confidence, 0.0, 1.0))
 
-    هذا ليس Position Size بحد ذاته.
+    base = 0.0
+    if current_regime == "BULL":
+        base = 1.00
+    elif current_regime.startswith("NEUTRAL"):
+        base = 0.60
+    elif current_regime == "BEAR":
+        base = 0.25
+    elif current_regime == "UNKNOWN":
+        base = 0.00
 
-    يمكن ضربه في base position size.
-
-    مثال:
-
-        final_size =
-            base_size
-            * garch_multiplier
-            * regime_multiplier
-
-    السياسة الافتراضية:
-
-        BULL:
-            1.00
-
-        NEUTRAL:
-            0.60
-
-        BEAR:
-            0.25
-
-        UNKNOWN:
-            0.00
-
-    ثم يتم تعديل المعامل بناءً على confidence.
-    """
-
-    current_regime = str(
-        current_regime
-    ).upper()
-
-    confidence = float(
-        np.clip(confidence, 0.0, 1.0)
-    )
-
-    base = {
-        "BULL": 1.00,
-        "NEUTRAL": 0.60,
-        "BEAR": 0.25,
-        "UNKNOWN": 0.00,
-    }.get(
-        current_regime,
-        0.0,
-    )
-
-    # Confidence gates exposure.
-    #
-    # confidence = 1.0
-    #     full multiplier
-    #
-    # confidence = 0.5
-    #     half multiplier
-
-    multiplier = base * confidence
-
-    return float(
-        np.clip(
-            multiplier,
-            min_multiplier,
-            max_multiplier,
-        )
-    )
+    return float(np.clip(base * confidence, min_multiplier, max_multiplier))
 
 
 # =====================================================================
-# REGIME STATISTICS
+# REGIME STATISTICS / TELEGRAM SUMMARY
 # =====================================================================
 
 def get_regime_stats(
@@ -1602,675 +850,128 @@ def get_regime_stats(
     n_states: int = DEFAULT_N_STATES,
     **kwargs: Any,
 ) -> list:
-    """
-    إحصائيات تفصيلية لكل Regime.
-    """
-
-    result = detect_regimes(
-        data=data,
-        n_states=n_states,
-        **kwargs,
-    )
-
-    state_statistics = (
-        result["state_statistics"]
-        .copy()
-    )
-
-    transition_matrix = result[
-        "transition_matrix"
-    ]
-
-    hidden_states = result[
-        "hidden_states"
-    ]
+    """Return compact per-regime statistics."""
+    result = detect_regimes(data=data, n_states=n_states, **kwargs)
+    matrix = result["transition_matrix"]
+    hidden_states = result["hidden_states"]
+    stats = result["state_statistics"]
 
     output = []
-
-    for state in state_statistics.index:
-
-        row = state_statistics.loc[state]
-
-        stay_probability = float(
-            transition_matrix[
-                state,
-                state,
-            ]
-        )
-
-        duration = _expected_duration(
-            stay_probability
-        )
-
-        persistence = _consecutive_count(
-            hidden_states,
-            int(state),
-        )
-
+    for state in stats.index:
+        state_int = int(state)
+        stay = float(matrix[state_int, state_int])
+        duration = _expected_duration(stay)
         output.append(
             {
-                "state": int(state),
-
-                "label": str(
-                    row["label"]
-                ),
-
-                "count": int(
-                    row["count"]
-                ),
-
-                "pct": round(
-                    float(row["pct"]),
-                    2,
-                ),
-
-                "mean_return": float(
-                    row["mean_return"]
-                ),
-
-                "mean_volatility": float(
-                    row["mean_volatility"]
-                ),
-
-                "mean_range": float(
-                    row["mean_range"]
-                ),
-
-                "mean_volume_z": float(
-                    row["mean_volume_z"]
-                ),
-
-                "mean_momentum": float(
-                    row["mean_momentum"]
-                ),
-
-                "stay_probability": round(
-                    stay_probability,
-                    6,
-                ),
-
+                "state": state_int,
+                "label": str(stats.loc[state, "label"]),
+                "count": int(stats.loc[state, "count"]),
+                "pct": round(float(stats.loc[state, "pct"]), 2),
+                "mean_return": float(stats.loc[state, "mean_return"]),
+                "mean_volatility": float(stats.loc[state, "mean_volatility"]),
+                "mean_range": float(stats.loc[state, "mean_range"]),
+                "mean_volume_z": float(stats.loc[state, "mean_volume_z"]),
+                "mean_momentum": float(stats.loc[state, "mean_momentum"]),
+                "stay_probability": round(stay, 6),
                 "expected_duration": (
-                    float(duration)
-                    if np.isfinite(duration)
-                    else float("inf")
+                    float(duration) if np.isfinite(duration) else float("inf")
                 ),
-
-                "current_persistence": int(
-                    persistence
-                ),
+                "current_persistence": _consecutive_count(hidden_states, state_int),
             }
         )
-
     return output
 
 
-# =====================================================================
-# SIMPLE SUMMARY
-# =====================================================================
-
-def summarize_regime(
-    result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    ملخص صغير مناسب لإرساله إلى Telegram.
-    """
+def summarize_regime(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a small Telegram-friendly summary from detect_regimes()."""
+    next_map = result["next_regime_probabilities"]
+    next_regime = max(next_map, key=next_map.get) if next_map else "UNKNOWN"
+    duration = result["expected_duration"]
 
     return {
-        "regime": result[
-            "reported_regime"
-        ],
-
-        "raw_regime": result[
-            "current_regime"
-        ],
-
-        "confidence": round(
-            float(result["confidence"]),
-            4,
-        ),
-
-        "uncertainty": round(
-            float(result["entropy"]),
-            4,
-        ),
-
-        "trusted": bool(
-            result["trusted"]
-        ),
-
-        "regime_probability": round(
-            float(result[
-                "current_probability"
-            ]),
-            4,
-        ),
-
-        "persistence": int(
-            result[
-                "state_persistence"
-            ]
-        ),
-
-        "stay_probability": round(
-            float(result[
-                "stay_probability"
-            ]),
-            4,
-        ),
-
-        "expected_duration": (
-            round(
-                float(
-                    result[
-                        "expected_duration"
-                    ]
-                ),
-                2,
-            )
-            if np.isfinite(
-                result[
-                    "expected_duration"
-                ]
-            )
-            else None
-        ),
-
-        "regime_changed": bool(
-            result[
-                "regime_changed"
-            ]
-        ),
-
-        "next_regime": max(
-            result[
-                "next_regime_probabilities"
-            ],
-            key=result[
-                "next_regime_probabilities"
-            ].get,
-        ),
-
-        "aic": round(
-            float(result["aic"]),
-            2,
-        ),
-
-        "bic": round(
-            float(result["bic"]),
-            2,
-        ),
-
-        "converged": bool(
-            result["converged"]
-        ),
+        "regime": result["reported_regime"],
+        "raw_regime": result["raw_regime"],
+        "confidence": round(float(result["confidence"]), 4),
+        "uncertainty": round(float(result["entropy"]), 4),
+        "trusted": bool(result["trusted"]),
+        "regime_probability": round(float(result["current_probability"]), 4),
+        "persistence": int(result["state_persistence"]),
+        "stay_probability": round(float(result["stay_probability"]), 4),
+        "expected_duration": round(float(duration), 2) if np.isfinite(duration) else None,
+        "regime_changed": bool(result["regime_changed"]),
+        "next_regime": next_regime,
+        "aic": round(float(result["aic"]), 2),
+        "bic": round(float(result["bic"]), 2),
+        "converged": bool(result["converged"]),
+        "feature_source": result["feature_source"],
+        "range_is_proxy": bool(result["range_is_proxy"]),
+        "volume_available": bool(result["volume_available"]),
     }
 
 
 # =====================================================================
-# TEST
+# SELF TEST
 # =====================================================================
 
-if __name__ == "__main__":
+def _synthetic_ohlcv(rows: int = 260, seed: int = 7) -> pd.DataFrame:
+    """Deterministic synthetic OHLCV for local smoke testing."""
+    rng = np.random.default_rng(seed)
+    returns = rng.normal(0.0002, 0.012, rows)
+    close = 100.0 * np.exp(np.cumsum(returns))
+    open_ = np.r_[100.0, close[:-1]]
+    spread = np.abs(rng.normal(0.0, 0.004, rows)) + 1e-4
+    high = np.maximum(open_, close) * (1.0 + spread)
+    low = np.minimum(open_, close) * (1.0 - spread)
+    volume = np.exp(rng.normal(10.0, 0.4, rows))
 
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        }
+    )
+
+
+if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
-        format=(
-            "%(asctime)s "
-            "[%(levelname)s] "
-            "%(message)s"
-        ),
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    print(
-        "\n"
-        + "=" * 78
-    )
-
-    print(
-        "ADVANCED HMM MARKET REGIME ENGINE - 4H"
-    )
-
-    print(
-        "=" * 78
-        + "\n"
-    )
-
-    symbol = "BTCUSDT"
+    print("\n=== MEGA HMM SELF TEST ===")
 
     try:
-
-        # ----------------------------------------------------------
-        # Fetch market data
-        # ----------------------------------------------------------
-
-        df = fetch_ohlcv(
-            symbol=symbol,
-            interval="4h",
-            limit=500,
-        )
-
-        print(
-            f"📊 Symbol: {symbol}"
-        )
-
-        print(
-            f"📊 Candles: {len(df)}"
-        )
-
-        # ----------------------------------------------------------
-        # Build and fit HMM
-        # ----------------------------------------------------------
-
+        # 1) Preferred OHLCV path.
+        df = _synthetic_ohlcv()
         result = detect_regimes(
             df,
             n_states=3,
-            n_iter=2000,
-            attempts=5,
+            n_iter=300,
+            attempts=3,
             random_state=42,
         )
+        print("OHLCV result:", summarize_regime(result))
 
-        # ----------------------------------------------------------
-        # Summary
-        # ----------------------------------------------------------
-
-        summary = summarize_regime(
-            result
-        )
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "🎯 CURRENT MARKET REGIME"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        print(
-            f"Regime           : "
-            f"{summary['regime']}"
-        )
-
-        print(
-            f"Raw Regime       : "
-            f"{summary['raw_regime']}"
-        )
-
-        print(
-            f"Confidence       : "
-            f"{summary['confidence']:.2%}"
-        )
-
-        print(
-            f"Uncertainty      : "
-            f"{summary['uncertainty']:.2%}"
-        )
-
-        print(
-            f"Trusted           : "
-            f"{summary['trusted']}"
-        )
-
-        print(
-            f"Probability       : "
-            f"{summary['regime_probability']:.2%}"
-        )
-
-        print(
-            f"Persistence       : "
-            f"{summary['persistence']} candles"
-        )
-
-        print(
-            f"Stay Probability  : "
-            f"{summary['stay_probability']:.2%}"
-        )
-
-        print(
-            f"Expected Duration : "
-            f"{summary['expected_duration']}"
-        )
-
-        print(
-            f"Regime Changed    : "
-            f"{summary['regime_changed']}"
-        )
-
-        print(
-            f"Next Regime       : "
-            f"{summary['next_regime']}"
-        )
-
-        # ----------------------------------------------------------
-        # Regime probabilities
-        # ----------------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "📊 CURRENT REGIME PROBABILITIES"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        for regime, probability in (
-            result[
-                "regime_probabilities"
-            ].items()
-        ):
-
-            print(
-                f"{regime:<12}: "
-                f"{probability:.2%}"
-            )
-
-        # ----------------------------------------------------------
-        # Next regime probabilities
-        # ----------------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "🔮 NEXT-STATE PROBABILITIES"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        for regime, probability in (
-            result[
-                "next_regime_probabilities"
-            ].items()
-        ):
-
-            print(
-                f"{regime:<12}: "
-                f"{probability:.2%}"
-            )
-
-        # ----------------------------------------------------------
-        # Transition matrix
-        # ----------------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "🔄 TRANSITION MATRIX"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        matrix = result[
-            "transition_matrix"
-        ]
-
-        labels = result["labels"]
-
-        for i in range(
-            result["n_states"]
-        ):
-
-            row_label = labels[i]
-
-            values = " | ".join(
-                [
-                    f"{matrix[i, j]:.3f}"
-                    for j in range(
-                        result["n_states"]
-                    )
-                ]
-            )
-
-            print(
-                f"{row_label:<10} -> "
-                f"{values}"
-            )
-
-        # ----------------------------------------------------------
-        # State statistics
-        # ----------------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "📈 REGIME STATISTICS"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        stats = get_regime_stats(
-            df,
-            n_states=3,
-            n_iter=2000,
-            attempts=5,
+        # 2) Legacy Series path: this is the path that previously raised
+        # KeyError('range'). It must now complete successfully.
+        returns = np.log(df["close"] / df["close"].shift(1)).dropna()
+        legacy = detect_regimes(
+            returns,
+            n_states=2,
+            n_iter=300,
+            attempts=3,
             random_state=42,
         )
+        print("Series result:", summarize_regime(legacy))
 
-        for item in stats:
+        compact = get_current_regime(returns, n_states=2)
+        print("Current regime:", compact)
 
-            print(
-                f"\n"
-                f"State      : "
-                f"{item['state']}"
-            )
-
-            print(
-                f"Label      : "
-                f"{item['label']}"
-            )
-
-            print(
-                f"Occurrences: "
-                f"{item['count']}"
-            )
-
-            print(
-                f"Share      : "
-                f"{item['pct']:.2f}%"
-            )
-
-            print(
-                f"Mean Return: "
-                f"{item['mean_return']:.6f}"
-            )
-
-            print(
-                f"Volatility : "
-                f"{item['mean_volatility']:.6f}"
-            )
-
-            print(
-                f"Range      : "
-                f"{item['mean_range']:.6f}"
-            )
-
-            print(
-                f"Volume Z   : "
-                f"{item['mean_volume_z']:.4f}"
-            )
-
-            print(
-                f"Momentum   : "
-                f"{item['mean_momentum']:.6f}"
-            )
-
-            print(
-                f"Stay Prob  : "
-                f"{item['stay_probability']:.2%}"
-            )
-
-            print(
-                f"Exp. Dur.  : "
-                f"{item['expected_duration']}"
-            )
-
-        # ----------------------------------------------------------
-        # Filter test
-        # ----------------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "🛡 HMM SIGNAL FILTER TEST"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        for test_signal in [1, 0, -1]:
-
-            filtered = filter_signals_by_regime(
-                signal=test_signal,
-                current_regime=(
-                    result[
-                        "reported_regime"
-                    ]
-                ),
-                confidence=(
-                    result[
-                        "confidence"
-                    ]
-                ),
-                min_confidence=0.55,
-                trusted=result[
-                    "trusted"
-                ],
-            )
-
-            print(
-                f"Signal "
-                f"{test_signal:+d} "
-                f"-> "
-                f"{filtered:+d}"
-            )
-
-        # ----------------------------------------------------------
-        # Risk multiplier
-        # ----------------------------------------------------------
-
-        multiplier = regime_risk_multiplier(
-            current_regime=(
-                result[
-                    "reported_regime"
-                ]
-            ),
-            confidence=(
-                result[
-                    "confidence"
-                ]
-            ),
-        )
-
-        print(
-            "\n"
-            f"🛡 Regime Risk Multiplier: "
-            f"{multiplier:.4f}"
-        )
-
-        # ----------------------------------------------------------
-        # Model metrics
-        # ----------------------------------------------------------
-
-        print(
-            "\n"
-            + "-" * 78
-        )
-
-        print(
-            "📐 MODEL QUALITY"
-        )
-
-        print(
-            "-" * 78
-        )
-
-        print(
-            f"Converged       : "
-            f"{result['converged']}"
-        )
-
-        print(
-            f"Log-Likelihood  : "
-            f"{result['log_likelihood']:.4f}"
-        )
-
-        print(
-            f"AIC             : "
-            f"{result['aic']:.2f}"
-        )
-
-        print(
-            f"BIC             : "
-            f"{result['bic']:.2f}"
-        )
-
-        print(
-            f"Observations    : "
-            f"{result['n_observations']}"
-        )
-
-        print(
-            f"Features        : "
-            f"{result['n_features']}"
-        )
-
-        print(
-            f"Parameters      : "
-            f"{result['n_parameters']}"
-        )
-
-        print(
-            "\n"
-            + "=" * 78
-        )
-
-        print(
-            "HMM TEST COMPLETED"
-        )
-
-        print(
-            "=" * 78
-            + "\n"
-        )
+        print("HMM SELF TEST PASSED")
 
     except Exception as exc:
-
-        log.exception(
-            "HMM test failed: %s",
-            exc,
-        )
-
-        print(
-            "\n❌ HMM ERROR:"
-        )
-
-        print(
-            str(exc)
-        )
+        log.exception("HMM self test failed: %s", exc)
+        raise
