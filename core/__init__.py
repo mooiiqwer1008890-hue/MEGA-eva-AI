@@ -1,0 +1,3 @@
+"""
+MEGA core package.
+"""
